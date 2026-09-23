@@ -1,3 +1,5 @@
+mod instance_lock;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,6 +129,8 @@ async fn main() -> Result<()> {
         }
         None => cli.run,
     };
+
+    let _instance_guard = instance_lock::acquire()?;
 
     let tui_mode = !run_args.headless;
     init_tracing(tui_mode)?;
@@ -350,9 +354,15 @@ async fn run(args: RunArgs) -> Result<()> {
     if headless {
         server.run(ListenerConfig { bind }).await
     } else {
+        // Bind synchronously, before the dashboard ever renders "SOCKS5:
+        // UP" — a bind failure (e.g. a port a stale previous instance was
+        // still holding, before instance_lock existed) must be a fatal,
+        // immediately visible startup error, not something a background
+        // task discovers after the fact.
+        let listener = server.bind(ListenerConfig { bind }).await?;
         let services = anonet_tui::ServicesInfo { socks_addr: bind };
         tokio::spawn(async move {
-            if let Err(err) = server.run(ListenerConfig { bind }).await {
+            if let Err(err) = server.serve(listener).await {
                 tracing::error!(error = %err, "SOCKS5 server stopped");
             }
         });

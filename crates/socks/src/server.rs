@@ -61,11 +61,24 @@ impl SocksServer {
     }
 
     pub async fn run(&self, cfg: ListenerConfig) -> Result<()> {
+        let listener = self.bind(cfg).await?;
+        self.serve(listener).await
+    }
+
+    /// Binds the listener without serving yet. Split out so a caller (the
+    /// dashboard) can fail loudly and immediately if the port is already
+    /// taken — e.g. by an orphaned previous `anonet` instance — instead of
+    /// finding out from a background task's error, well after having
+    /// already rendered "SOCKS5: UP".
+    pub async fn bind(&self, cfg: ListenerConfig) -> Result<TcpListener> {
         let listener = TcpListener::bind(cfg.bind)
             .await
             .with_context(|| format!("failed to bind SOCKS5 listener on {}", cfg.bind))?;
         info!(addr = %cfg.bind, "SOCKS5 listener up");
+        Ok(listener)
+    }
 
+    pub async fn serve(&self, listener: TcpListener) -> Result<()> {
         loop {
             let (stream, peer) = listener.accept().await?;
             let core = Arc::clone(&self.core);
