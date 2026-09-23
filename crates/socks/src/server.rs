@@ -1,9 +1,14 @@
-//! Minimal hand-rolled SOCKS5 (RFC 1928) front end, CONNECT-only, no-auth.
+//! Minimal hand-rolled SOCKS5 (RFC 1928/1929) front end, CONNECT-only.
 //!
-//! Milestone 1 scope: accept a connection, parse the CONNECT request, forward
-//! the raw destination (hostname preferred) into `AnonCore::connect`, and
-//! splice bytes both ways. Auth-based isolation keys, IP-request rejection
-//! (DNS-leak policy) and ACLs are added in later milestones.
+//! Milestone 2 scope: accept a connection, negotiate either no-auth or
+//! username/password auth, parse the CONNECT request, forward the raw
+//! destination (hostname preferred) into `AnonCore::connect_isolated`, and
+//! splice bytes both ways. The SOCKS5 username (when the client
+//! authenticates) is used purely as an *isolation key* — like Tor's own
+//! `IsolateSOCKSAuth` — not as a real credential check: any username/password
+//! is accepted, but distinct usernames get distinct circuits. Clients that
+//! skip auth all share one "default" isolation bucket.
+//! IP-request rejection (DNS-leak policy) and ACLs land in a later milestone.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -17,7 +22,11 @@ use anonet_core::AnonCore;
 
 const SOCKS_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
+const METHOD_USERPASS: u8 = 0x02;
 const METHOD_NONE_ACCEPTABLE: u8 = 0xFF;
+const USERPASS_VERSION: u8 = 0x01;
+const USERPASS_STATUS_OK: u8 = 0x00;
+const DEFAULT_ISOLATION: &str = "default";
 const CMD_CONNECT: u8 = 0x01;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
@@ -64,7 +73,7 @@ impl SocksServer {
 }
 
 async fn handle_conn(mut client: TcpStream, core: Arc<AnonCore>) -> Result<()> {
-    negotiate_method(&mut client).await?;
+    let identity = negotiate_method(&mut client).await?;
     let (dest, port) = read_connect_request(&mut client).await?;
 
     let host_for_connect = match &dest {
@@ -75,7 +84,10 @@ async fn handle_conn(mut client: TcpStream, core: Arc<AnonCore>) -> Result<()> {
         }
     };
 
-    let upstream = match core.connect(&host_for_connect, port).await {
+    let upstream = match core
+        .connect_isolated(&host_for_connect, port, &identity)
+        .await
+    {
         Ok(s) => s,
         Err(err) => {
             send_reply(&mut client, REP_GENERAL_FAILURE).await.ok();
@@ -87,7 +99,10 @@ async fn handle_conn(mut client: TcpStream, core: Arc<AnonCore>) -> Result<()> {
     splice(client, upstream).await
 }
 
-async fn negotiate_method(client: &mut TcpStream) -> Result<()> {
+/// Negotiates the SOCKS5 auth method and returns the isolation identity to
+/// use for this connection: the authenticated username, or `"default"` if
+/// the client chose not to authenticate.
+async fn negotiate_method(client: &mut TcpStream) -> Result<String> {
     let mut hdr = [0u8; 2];
     client.read_exact(&mut hdr).await?;
     let [ver, nmethods] = hdr;
@@ -97,14 +112,49 @@ async fn negotiate_method(client: &mut TcpStream) -> Result<()> {
     let mut methods = vec![0u8; nmethods as usize];
     client.read_exact(&mut methods).await?;
 
-    if methods.contains(&METHOD_NO_AUTH) {
+    if methods.contains(&METHOD_USERPASS) {
+        client.write_all(&[SOCKS_VERSION, METHOD_USERPASS]).await?;
+        read_userpass_identity(client).await
+    } else if methods.contains(&METHOD_NO_AUTH) {
         client.write_all(&[SOCKS_VERSION, METHOD_NO_AUTH]).await?;
-        Ok(())
+        Ok(DEFAULT_ISOLATION.to_string())
     } else {
         client
             .write_all(&[SOCKS_VERSION, METHOD_NONE_ACCEPTABLE])
             .await?;
         bail!("client offered no acceptable auth method");
+    }
+}
+
+/// RFC 1929 username/password subnegotiation. The password is read (the
+/// protocol requires it) but never checked — only the username is used, as
+/// an isolation key rather than a credential.
+async fn read_userpass_identity(client: &mut TcpStream) -> Result<String> {
+    let mut ver = [0u8; 1];
+    client.read_exact(&mut ver).await?;
+    if ver[0] != USERPASS_VERSION {
+        bail!("unsupported username/password subnegotiation version {}", ver[0]);
+    }
+
+    let mut ulen = [0u8; 1];
+    client.read_exact(&mut ulen).await?;
+    let mut uname = vec![0u8; ulen[0] as usize];
+    client.read_exact(&mut uname).await?;
+
+    let mut plen = [0u8; 1];
+    client.read_exact(&mut plen).await?;
+    let mut passwd = vec![0u8; plen[0] as usize];
+    client.read_exact(&mut passwd).await?;
+
+    client
+        .write_all(&[USERPASS_VERSION, USERPASS_STATUS_OK])
+        .await?;
+
+    let identity = String::from_utf8(uname).context("SOCKS5 username was not valid UTF-8")?;
+    if identity.is_empty() {
+        Ok(DEFAULT_ISOLATION.to_string())
+    } else {
+        Ok(identity)
     }
 }
 

@@ -1,13 +1,36 @@
-//! Wraps `arti-client` bootstrap and exposes a minimal async connect API.
-//! Isolation policy and circuit lifecycle management land in later milestones.
+//! Wraps `arti-client` bootstrap and exposes a minimal async connect API,
+//! plus a stream-isolation policy engine (milestone 2). Circuit
+//! health/rotation lands in a later milestone.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use arti_client::{TorClient, TorClientConfig};
 use arti_client::config::TorClientConfigBuilder;
+use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
 use tor_rtcompat::PreferredRuntime;
 
+/// Maps an opaque "app identity" string to a stable [`IsolationToken`], so
+/// repeated connections carrying the same identity share a circuit pool
+/// while different identities never do. Identities are typically the SOCKS5
+/// username a client authenticates with (see `anonet-socks`).
+#[derive(Default)]
+struct IsolationPolicy {
+    tokens: Mutex<HashMap<String, IsolationToken>>,
+}
+
+impl IsolationPolicy {
+    fn token_for(&self, identity: &str) -> IsolationToken {
+        let mut tokens = self.tokens.lock().expect("isolation map poisoned");
+        *tokens
+            .entry(identity.to_string())
+            .or_insert_with(IsolationToken::new)
+    }
+}
+
 pub struct AnonCore {
-    client: std::sync::Arc<TorClient<PreferredRuntime>>,
+    client: Arc<TorClient<PreferredRuntime>>,
+    isolation: IsolationPolicy,
 }
 
 impl AnonCore {
@@ -20,7 +43,10 @@ impl AnonCore {
         let client = TorClient::create_bootstrapped(config)
             .await
             .context("failed to bootstrap Tor client")?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            isolation: IsolationPolicy::default(),
+        })
     }
 
     pub fn config_builder() -> TorClientConfigBuilder {
@@ -34,6 +60,24 @@ impl AnonCore {
             .connect((host, port))
             .await
             .with_context(|| format!("failed to connect to {host}:{port} via Tor"))
+    }
+
+    /// Opens an anonymized stream isolated by `identity`: connections that
+    /// share an identity may share a circuit; connections with different
+    /// identities never do.
+    pub async fn connect_isolated(
+        &self,
+        host: &str,
+        port: u16,
+        identity: &str,
+    ) -> Result<arti_client::DataStream> {
+        let token = self.isolation.token_for(identity);
+        let mut prefs = StreamPrefs::new();
+        prefs.set_isolation(token);
+        self.client
+            .connect_with_prefs((host, port), &prefs)
+            .await
+            .with_context(|| format!("failed to connect to {host}:{port} via Tor (isolation={identity})"))
     }
 
     pub fn inner(&self) -> &TorClient<PreferredRuntime> {
