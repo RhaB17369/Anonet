@@ -282,7 +282,7 @@ async fn run(args: RunArgs) -> Result<()> {
     let mut active_bridge_idx: Option<usize> = None;
     let core = if manager.candidate_count() == 0 {
         tracing::info!("bootstrapping Tor client (this can take a few seconds)");
-        let core = AnonCore::bootstrap().await?;
+        let core = bootstrap_with_progress("bootstrapping Tor", AnonCore::bootstrap()).await?;
         tracing::info!("Tor client bootstrapped");
         core
     } else {
@@ -304,14 +304,14 @@ async fn run(args: RunArgs) -> Result<()> {
             Ok((idx, config)) => {
                 tracing::info!(candidate = idx, "bridge healthy, bootstrapping real client through it");
                 active_bridge_idx = Some(idx);
-                AnonCore::bootstrap_with(config).await?
+                bootstrap_with_progress("bootstrapping Tor via bridge", AnonCore::bootstrap_with(config)).await?
             }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     "no configured bridge passed its health check; falling back to a direct (bridge-less) Tor connection"
                 );
-                AnonCore::bootstrap().await?
+                bootstrap_with_progress("bootstrapping Tor (direct fallback)", AnonCore::bootstrap()).await?
             }
         }
     };
@@ -367,6 +367,32 @@ async fn run(args: RunArgs) -> Result<()> {
             full_anon,
         )
         .await
+    }
+}
+
+/// Bootstrapping Tor can take anywhere from a few seconds to (rarely,
+/// under bad network conditions) over a minute, and this always runs
+/// *before* the dashboard takes over the screen — so without some visible
+/// sign of life, a slow bootstrap looks indistinguishable from a hang.
+/// Prints directly to stdout (not through `tracing`, which is already
+/// redirected to a log file by the time the dashboard runs) every 5s
+/// until `fut` resolves.
+async fn bootstrap_with_progress(
+    label: &str,
+    fut: impl std::future::Future<Output = Result<AnonCore>>,
+) -> Result<AnonCore> {
+    println!("{label}...");
+    tokio::pin!(fut);
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.tick().await; // the first tick fires immediately; skip it
+    let start = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            res = &mut fut => return res,
+            _ = ticker.tick() => {
+                println!("{label}... still working ({}s elapsed)", start.elapsed().as_secs());
+            }
+        }
     }
 }
 
