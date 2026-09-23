@@ -12,6 +12,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 anonet-core = { path = "../core" }
+anonet-telemetry = { path = "../telemetry" }
 arti-client = { version = "0.46", features = ["tokio", "rustls", "bridge-client", "pt-client"] }
 tempfile = "3"
 

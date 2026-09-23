@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
-use anonet_core::AnonCore;
+use anonet_core::CoreHandle;
 use anonet_leakguard::{Destination, LeakPolicy};
 
 const SOCKS_VERSION: u8 = 0x05;
@@ -45,16 +45,16 @@ pub struct ListenerConfig {
 }
 
 pub struct SocksServer {
-    core: Arc<AnonCore>,
+    core: Arc<CoreHandle>,
     policy: LeakPolicy,
 }
 
 impl SocksServer {
-    pub fn new(core: Arc<AnonCore>) -> Self {
+    pub fn new(core: Arc<CoreHandle>) -> Self {
         Self::with_policy(core, LeakPolicy::strict())
     }
 
-    pub fn with_policy(core: Arc<AnonCore>, policy: LeakPolicy) -> Self {
+    pub fn with_policy(core: Arc<CoreHandle>, policy: LeakPolicy) -> Self {
         Self { core, policy }
     }
 
@@ -77,7 +77,7 @@ impl SocksServer {
     }
 }
 
-async fn handle_conn(mut client: TcpStream, core: Arc<AnonCore>, policy: LeakPolicy) -> Result<()> {
+async fn handle_conn(mut client: TcpStream, core: Arc<CoreHandle>, policy: LeakPolicy) -> Result<()> {
     let identity = negotiate_method(&mut client).await?;
     let (dest, port) = read_connect_request(&mut client).await?;
 
@@ -92,6 +92,7 @@ async fn handle_conn(mut client: TcpStream, core: Arc<AnonCore>, policy: LeakPol
         Destination::Ip(ip) => ip.to_string(),
     };
 
+    let core = core.current().await;
     let upstream = match core
         .connect_isolated(&host_for_connect, port, &identity)
         .await

@@ -25,6 +25,10 @@
 //! with the winning config, so it never carries over a stale direct-Tor
 //! guard either.
 
+mod monitor;
+
+pub use monitor::BridgeMonitor;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -120,6 +124,10 @@ impl BridgeManager {
         self.candidates.lock().expect("poisoned").len()
     }
 
+    pub fn candidate_line(&self, idx: usize) -> Option<String> {
+        self.candidates.lock().expect("poisoned").get(idx).map(|c| c.line.clone())
+    }
+
     fn candidate(&self, idx: usize) -> Result<Candidate> {
         self.candidates
             .lock()
@@ -154,7 +162,7 @@ impl BridgeManager {
     /// inherit guard state from anywhere else) using only candidate `idx`,
     /// then attempts one real connection through it. The throwaway client
     /// and its temp directories are dropped when this returns.
-    async fn health_check(&self, idx: usize, timeout: Duration) -> HealthResult {
+    pub async fn health_check(&self, idx: usize, timeout: Duration) -> HealthResult {
         let line = self
             .candidate(idx)
             .map(|c| c.line)

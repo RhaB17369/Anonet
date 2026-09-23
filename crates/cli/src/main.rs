@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use anonet_bridges::{BridgeManager, TransportBinary};
-use anonet_core::AnonCore;
+use anonet_bridges::{BridgeManager, BridgeMonitor, TransportBinary};
+use anonet_core::{AnonCore, CoreHandle};
 use anonet_leakguard::{DnsShim, KillSwitch, current_uid};
 use anonet_socks::{ListenerConfig, SocksServer};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -42,6 +42,16 @@ enum Command {
         /// using SOCKS5 hostname CONNECT.
         #[arg(long = "dns-shim", value_name = "ADDR")]
         dns_shim: Option<SocketAddr>,
+
+        /// Seconds between background health checks of the active bridge
+        /// once running. Only meaningful when --bridge is used.
+        #[arg(long, default_value_t = 60)]
+        bridge_check_interval_secs: u64,
+
+        /// Consecutive failed health checks before searching for a
+        /// replacement bridge.
+        #[arg(long, default_value_t = 3)]
+        bridge_failure_threshold: u32,
     },
 
     /// Manage the nftables kill switches. Requires root.
@@ -100,7 +110,20 @@ async fn main() -> Result<()> {
             pluggable_transports,
             bridge_timeout_secs,
             dns_shim,
-        } => run(bind, bridges, pluggable_transports, bridge_timeout_secs, dns_shim).await,
+            bridge_check_interval_secs,
+            bridge_failure_threshold,
+        } => {
+            run(
+                bind,
+                bridges,
+                pluggable_transports,
+                bridge_timeout_secs,
+                dns_shim,
+                bridge_check_interval_secs,
+                bridge_failure_threshold,
+            )
+            .await
+        }
         Command::Killswitch { action } => killswitch(action).await,
     }
 }
@@ -188,7 +211,28 @@ async fn run(
     pluggable_transports: Vec<String>,
     bridge_timeout_secs: u64,
     dns_shim: Option<SocketAddr>,
+    bridge_check_interval_secs: u64,
+    bridge_failure_threshold: u32,
 ) -> Result<()> {
+    let (telemetry, mut health_rx) = anonet_telemetry::channel();
+
+    // Log every telemetry change, so live health/failover state is visible
+    // today without needing the jalon-6 TUI to read the same channel.
+    tokio::spawn(async move {
+        while health_rx.changed().await.is_ok() {
+            let status = health_rx.borrow().clone();
+            tracing::info!(
+                active_bridge = ?status.active_bridge_line,
+                consecutive_failures = status.consecutive_failures,
+                total_switches = status.total_switches,
+                "health status updated"
+            );
+        }
+    });
+
+    let mut active_bridge_idx: Option<usize> = None;
+    let mut bridge_manager: Option<BridgeManager> = None;
+
     let core = if bridges.is_empty() {
         tracing::info!("bootstrapping Tor client (this can take a few seconds)");
         let core = AnonCore::bootstrap().await?;
@@ -206,12 +250,13 @@ async fn run(
         }
 
         tracing::info!(count = bridges.len(), "checking configured bridges");
-        match manager
+        let core = match manager
             .find_healthy_config(Duration::from_secs(bridge_timeout_secs))
             .await
         {
             Ok((idx, config)) => {
                 tracing::info!(candidate = idx, "bridge healthy, bootstrapping real client through it");
+                active_bridge_idx = Some(idx);
                 AnonCore::bootstrap_with(config).await?
             }
             Err(err) => {
@@ -221,13 +266,30 @@ async fn run(
                 );
                 AnonCore::bootstrap().await?
             }
-        }
+        };
+        bridge_manager = Some(manager);
+        core
     };
 
-    let core = Arc::new(core);
+    let handle = Arc::new(CoreHandle::new(core));
+
+    if let (Some(manager), Some(idx)) = (bridge_manager, active_bridge_idx) {
+        let monitor = BridgeMonitor::new(
+            manager,
+            Arc::clone(&handle),
+            telemetry,
+            idx,
+            Duration::from_secs(bridge_check_interval_secs),
+            Duration::from_secs(bridge_timeout_secs),
+            bridge_failure_threshold,
+        );
+        tokio::spawn(async move {
+            monitor.run().await;
+        });
+    }
 
     if let Some(dns_bind) = dns_shim {
-        let shim = DnsShim::new(Arc::clone(&core));
+        let shim = DnsShim::new(Arc::clone(&handle));
         tokio::spawn(async move {
             if let Err(err) = shim.run(dns_bind).await {
                 tracing::error!(error = %err, "DNS shim stopped");
@@ -235,7 +297,7 @@ async fn run(
         });
     }
 
-    let server = SocksServer::new(core);
+    let server = SocksServer::new(handle);
     server.run(ListenerConfig { bind }).await
 }
 

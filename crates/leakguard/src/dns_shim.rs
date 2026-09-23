@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-use anonet_core::AnonCore;
+use anonet_core::CoreHandle;
 
 const QTYPE_A: u16 = 1;
 const QTYPE_AAAA: u16 = 28;
@@ -26,7 +26,7 @@ const RCODE_NOTIMP: u8 = 4;
 const ANSWER_TTL_SECS: u32 = 60;
 
 pub struct DnsShim {
-    core: Arc<AnonCore>,
+    core: Arc<CoreHandle>,
 }
 
 struct ParsedQuery {
@@ -39,7 +39,7 @@ struct ParsedQuery {
 }
 
 impl DnsShim {
-    pub fn new(core: Arc<AnonCore>) -> Self {
+    pub fn new(core: Arc<CoreHandle>) -> Self {
         Self { core }
     }
 
@@ -67,7 +67,7 @@ impl DnsShim {
 }
 
 async fn handle_query(
-    core: &AnonCore,
+    core: &CoreHandle,
     socket: &UdpSocket,
     request: &[u8],
     peer: SocketAddr,
@@ -86,6 +86,7 @@ async fn handle_query(
         return Ok(());
     }
 
+    let core = core.current().await;
     let response = match core.resolve(&query.qname).await {
         Ok(ips) => {
             let wanted_v6 = query.qtype == QTYPE_AAAA;
