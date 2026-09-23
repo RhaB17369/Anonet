@@ -86,13 +86,25 @@ impl KillSwitch {
         }
     }
 
+    /// `Ok(true)`/`Ok(false)` when we could actually tell; `Err` when `nft`
+    /// couldn't answer at all (e.g. no permission to read netlink state) —
+    /// callers must not conflate that with "disabled".
     pub async fn is_enabled(&self) -> Result<bool> {
         let output = Command::new("nft")
             .args(["list", "table", "inet", self.table()])
             .output()
             .await
             .context("failed to run `nft list table`")?;
-        Ok(output.status.success())
+        if output.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("No such file or directory") {
+            // The table genuinely doesn't exist: this kill switch is off.
+            Ok(false)
+        } else {
+            bail!("nft could not report table status: {}", stderr.trim());
+        }
     }
 }
 
