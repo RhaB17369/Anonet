@@ -5,9 +5,9 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use anonet_bridges::{BridgeManager, TransportBinary};
 use anonet_core::AnonCore;
-use anonet_leakguard::DnsShim;
+use anonet_leakguard::{DnsShim, KillSwitch, current_uid};
 use anonet_socks::{ListenerConfig, SocksServer};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "anonet", version, about = "Rust orchestration layer on top of Tor")]
@@ -43,6 +43,47 @@ enum Command {
         #[arg(long = "dns-shim", value_name = "ADDR")]
         dns_shim: Option<SocketAddr>,
     },
+
+    /// Manage the nftables kill switches. Requires root.
+    Killswitch {
+        #[command(subcommand)]
+        action: KillswitchAction,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum KsMode {
+    /// Confine one UID to loopback only (protects that one app).
+    Scoped,
+    /// Drop all non-loopback egress except anonet's own UID (whole-machine).
+    Radical,
+}
+
+#[derive(Subcommand)]
+enum KillswitchAction {
+    /// Apply a kill switch.
+    Enable {
+        #[arg(long, value_enum)]
+        mode: KsMode,
+
+        /// UID to confine to loopback. Required for --mode scoped.
+        #[arg(long)]
+        protect_uid: Option<u32>,
+
+        /// Auto-disable after this many seconds (or on Ctrl+C). Strongly
+        /// recommended for --mode radical, since it can otherwise cut off
+        /// this machine's normal network access until you remember to run
+        /// `killswitch disable` yourself.
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+    },
+    /// Remove a kill switch (idempotent: fine to call if it's already off).
+    Disable {
+        #[arg(long, value_enum)]
+        mode: KsMode,
+    },
+    /// Report whether each kill switch is currently active.
+    Status,
 }
 
 #[tokio::main]
@@ -60,6 +101,84 @@ async fn main() -> Result<()> {
             bridge_timeout_secs,
             dns_shim,
         } => run(bind, bridges, pluggable_transports, bridge_timeout_secs, dns_shim).await,
+        Command::Killswitch { action } => killswitch(action).await,
+    }
+}
+
+async fn killswitch(action: KillswitchAction) -> Result<()> {
+    match action {
+        KillswitchAction::Enable {
+            mode,
+            protect_uid,
+            ttl_secs,
+        } => {
+            let ks = match mode {
+                KsMode::Scoped => {
+                    let uid = protect_uid
+                        .ok_or_else(|| anyhow!("--mode scoped requires --protect-uid <uid>"))?;
+                    KillSwitch::Scoped { protect_uid: uid }
+                }
+                KsMode::Radical => {
+                    let uid = current_uid().await?;
+                    tracing::info!(anonet_uid = uid, "radical kill switch will exempt this process's own UID");
+                    KillSwitch::Radical { anonet_uid: uid }
+                }
+            };
+
+            let ttl_secs = ttl_secs.or(match mode {
+                KsMode::Radical => Some(300),
+                KsMode::Scoped => None,
+            });
+
+            ks.enable().await?;
+            tracing::info!(mode = mode_label(mode), "kill switch enabled");
+
+            match ttl_secs {
+                None => {
+                    println!("Kill switch enabled with no TTL. Run `anonet killswitch disable --mode {}` to remove it.", mode_label(mode));
+                    Ok(())
+                }
+                Some(secs) => {
+                    println!(
+                        "Kill switch enabled for up to {secs}s (Ctrl+C disables it immediately)."
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(secs)) => {
+                            tracing::info!("TTL elapsed, disabling kill switch");
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            tracing::info!("Ctrl+C received, disabling kill switch");
+                        }
+                    }
+                    ks.disable().await?;
+                    println!("Kill switch disabled.");
+                    Ok(())
+                }
+            }
+        }
+        KillswitchAction::Disable { mode } => {
+            let ks = match mode {
+                KsMode::Scoped => KillSwitch::Scoped { protect_uid: 0 },
+                KsMode::Radical => KillSwitch::Radical { anonet_uid: 0 },
+            };
+            ks.disable().await?;
+            println!("Kill switch ({}) disabled.", mode_label(mode));
+            Ok(())
+        }
+        KillswitchAction::Status => {
+            let scoped = KillSwitch::Scoped { protect_uid: 0 }.is_enabled().await?;
+            let radical = KillSwitch::Radical { anonet_uid: 0 }.is_enabled().await?;
+            println!("scoped:  {}", if scoped { "ENABLED" } else { "disabled" });
+            println!("radical: {}", if radical { "ENABLED" } else { "disabled" });
+            Ok(())
+        }
+    }
+}
+
+fn mode_label(mode: KsMode) -> &'static str {
+    match mode {
+        KsMode::Scoped => "scoped",
+        KsMode::Radical => "radical",
     }
 }
 
