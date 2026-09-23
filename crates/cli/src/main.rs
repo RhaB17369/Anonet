@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use anonet_bridges::{BridgeCoordinator, BridgeManager, TransportBinary};
 use anonet_core::{AnonCore, CoreHandle};
-use anonet_leakguard::{DnsShim, KillSwitch, current_uid};
+use anonet_leakguard::{DnsShimController, KillSwitch, current_uid};
 use anonet_socks::{ListenerConfig, SocksServer};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -338,30 +338,31 @@ async fn run(args: RunArgs) -> Result<()> {
         });
     }
 
+    let dns_controller = Arc::new(DnsShimController::new(Arc::clone(&handle)));
     if let Some(dns_bind) = dns_shim {
-        let shim = DnsShim::new(Arc::clone(&handle));
-        tokio::spawn(async move {
-            if let Err(err) = shim.run(dns_bind).await {
-                tracing::error!(error = %err, "DNS shim stopped");
-            }
-        });
+        dns_controller.start(dns_bind)?;
     }
 
     let server = SocksServer::new(Arc::clone(&handle), telemetry.clone());
     if headless {
         server.run(ListenerConfig { bind }).await
     } else {
-        let services = anonet_tui::ServicesInfo {
-            socks_addr: bind,
-            dns_shim_addr: dns_shim,
-            bridges_configured: manager.candidate_count(),
-        };
+        let services = anonet_tui::ServicesInfo { socks_addr: bind };
         tokio::spawn(async move {
             if let Err(err) = server.run(ListenerConfig { bind }).await {
                 tracing::error!(error = %err, "SOCKS5 server stopped");
             }
         });
-        anonet_tui::run(handle, health_rx, check_now, anonet_log_path(), services, coordinator).await
+        anonet_tui::run(
+            handle,
+            health_rx,
+            check_now,
+            anonet_log_path(),
+            services,
+            coordinator,
+            dns_controller,
+        )
+        .await
     }
 }
 

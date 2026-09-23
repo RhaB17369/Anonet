@@ -5,17 +5,20 @@
 //! the app uses, no separate IPC. This is the default UI (`anonet` with
 //! no flags); `--headless` skips it.
 //!
-//! Two actions are exposed, both safe to trigger from a keypress:
+//! Every feature the process has is reachable live from here, not just at
+//! launch:
 //! - `a`: type in a new bridge line and try it live, via
 //!   `anonet-bridges::BridgeCoordinator::try_add_bridge` — the same
 //!   activate-if-healthy path automatic failover uses, just triggered
 //!   manually instead of by the background monitor.
-//! - `d`: disable a kill switch. Deliberately one-directional — turning
-//!   one off is always safe to offer here, but turning the disruptive
-//!   radical one on stays behind the explicit `anonet killswitch enable`
-//!   command, not a stray keypress.
 //! - `c`: force an immediate health check of the active bridge instead of
 //!   waiting out the rest of the check interval.
+//! - `n`: toggle the DNS shim on (asks for a bind address) or off.
+//! - `k`: enable a kill switch (scoped asks for the UID to confine;
+//!   radical asks for confirmation, since it blocks the whole machine's
+//!   non-loopback traffic — it auto-reverts after 5 minutes regardless,
+//!   so a confirmed mistake here is never permanent).
+//! - `d`: disable a kill switch — always a safe, one-key action.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -36,7 +39,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
 use tokio::sync::{Notify, watch};
 
 use anonet_core::CoreHandle;
-use anonet_leakguard::KillSwitch;
+use anonet_leakguard::{DnsShimController, KillSwitch, current_uid};
 use anonet_telemetry::HealthStatus;
 
 const LOG_TAIL_LINES: usize = 10;
@@ -61,14 +64,33 @@ struct KillSwitchView {
 #[derive(Clone)]
 pub struct ServicesInfo {
     pub socks_addr: SocketAddr,
-    pub dns_shim_addr: Option<SocketAddr>,
-    pub bridges_configured: usize,
 }
 
 enum Mode {
     Normal,
     ConfirmDisable,
     AddBridge { buffer: String },
+    KillSwitchMenu,
+    EnterScopedUid { buffer: String },
+    ConfirmRadicalEnable,
+    EnterDnsAddr { buffer: String },
+}
+
+/// The context-sensitive, always-visible list of keys available right now
+/// — separate from `status_line`, which holds one-off results ("bridge
+/// added") that would otherwise bury the help text the moment something
+/// happens. This is what makes the available actions visible live rather
+/// than something you have to already know.
+fn help_text(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::Normal => "q quit   a add bridge   c check bridge now   n toggle DNS shim   k enable a kill switch   d disable a kill switch",
+        Mode::ConfirmDisable => "s disable scoped   r disable radical   Esc cancel",
+        Mode::AddBridge { .. } => "type a Bridge line   Enter submit   Esc cancel",
+        Mode::KillSwitchMenu => "s enable scoped (asks for a UID)   r enable radical (asks to confirm)   Esc cancel",
+        Mode::EnterScopedUid { .. } => "type the UID to confine to loopback   Enter apply   Esc cancel",
+        Mode::ConfirmRadicalEnable => "y confirm (blocks ALL non-loopback traffic for 5 min, auto-reverts)   Esc cancel",
+        Mode::EnterDnsAddr { .. } => "type a bind address (e.g. 127.0.0.1:9535)   Enter apply   Esc cancel",
+    }
 }
 
 struct AppState {
@@ -77,6 +99,7 @@ struct AppState {
     health: HealthStatus,
     isolation: Vec<(String, u32, Duration)>,
     killswitches: KillSwitchView,
+    dns_shim_addr: Option<SocketAddr>,
     status_line: String,
     mode: Mode,
     log_tail: Vec<String>,
@@ -97,6 +120,7 @@ pub async fn run(
     log_path: PathBuf,
     services: ServicesInfo,
     coordinator: Arc<BridgeCoordinator>,
+    dns_controller: Arc<DnsShimController>,
 ) -> Result<()> {
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -111,7 +135,8 @@ pub async fn run(
         health: health_rx.borrow().clone(),
         isolation: Vec::new(),
         killswitches: KillSwitchView::default(),
-        status_line: "q: quit   a: add bridge   c: check bridge now   d: disable a kill switch".to_string(),
+        dns_shim_addr: dns_controller.bound_addr(),
+        status_line: String::new(),
         mode: Mode::Normal,
         log_tail: Vec::new(),
     };
@@ -135,11 +160,12 @@ pub async fn run(
             _ = refresh_tick.tick() => {
                 refresh_snapshot(&core, &log_path, &mut state).await;
                 refresh_killswitch_status(&mut state).await;
+                state.dns_shim_addr = dns_controller.bound_addr();
             }
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        if handle_key(key.code, &mut state, &check_now, &coordinator).await {
+                        if handle_key(key.code, &mut state, &check_now, &coordinator, &dns_controller).await {
                             break;
                         }
                     }
@@ -183,6 +209,7 @@ async fn handle_key(
     state: &mut AppState,
     check_now: &Notify,
     coordinator: &Arc<BridgeCoordinator>,
+    dns_controller: &Arc<DnsShimController>,
 ) -> bool {
     match &mut state.mode {
         Mode::ConfirmDisable => {
@@ -244,6 +271,110 @@ async fn handle_key(
             }
             return false;
         }
+        Mode::KillSwitchMenu => {
+            match code {
+                KeyCode::Char('s') => {
+                    state.mode = Mode::EnterScopedUid { buffer: String::new() };
+                }
+                KeyCode::Char('r') => {
+                    state.mode = Mode::ConfirmRadicalEnable;
+                }
+                KeyCode::Esc => {
+                    state.mode = Mode::Normal;
+                    state.status_line = "cancelled".to_string();
+                }
+                _ => {}
+            }
+            return false;
+        }
+        Mode::EnterScopedUid { buffer } => {
+            match code {
+                KeyCode::Enter => {
+                    let typed = buffer.clone();
+                    state.mode = Mode::Normal;
+                    match typed.trim().parse::<u32>() {
+                        Ok(uid) => {
+                            state.status_line = match (KillSwitch::Scoped { protect_uid: uid }).enable().await {
+                                Ok(()) => format!("scoped kill switch enabled, confining uid {uid} to loopback"),
+                                Err(err) => format!("failed to enable scoped kill switch: {err}"),
+                            };
+                            refresh_killswitch_status(state).await;
+                        }
+                        Err(_) => {
+                            state.status_line = format!("'{typed}' is not a valid UID, cancelled");
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    state.mode = Mode::Normal;
+                    state.status_line = "cancelled".to_string();
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    buffer.push(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+        Mode::ConfirmRadicalEnable => {
+            match code {
+                KeyCode::Char('y') => {
+                    state.mode = Mode::Normal;
+                    state.status_line = "enabling radical kill switch...".to_string();
+                    tokio::spawn(async move {
+                        let Ok(uid) = current_uid().await else {
+                            return;
+                        };
+                        let ks = KillSwitch::Radical { anonet_uid: uid };
+                        if ks.enable().await.is_ok() {
+                            tokio::time::sleep(Duration::from_secs(300)).await;
+                            let _ = ks.disable().await;
+                        }
+                    });
+                }
+                KeyCode::Esc => {
+                    state.mode = Mode::Normal;
+                    state.status_line = "cancelled".to_string();
+                }
+                _ => {}
+            }
+            return false;
+        }
+        Mode::EnterDnsAddr { buffer } => {
+            match code {
+                KeyCode::Enter => {
+                    let typed = buffer.clone();
+                    state.mode = Mode::Normal;
+                    match typed.trim().parse::<SocketAddr>() {
+                        Ok(addr) => {
+                            state.status_line = match dns_controller.start(addr) {
+                                Ok(()) => format!("DNS shim started on {addr}"),
+                                Err(err) => format!("failed to start DNS shim: {err}"),
+                            };
+                            state.dns_shim_addr = dns_controller.bound_addr();
+                        }
+                        Err(_) => {
+                            state.status_line = format!("'{typed}' is not a valid address (expected host:port)");
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    state.mode = Mode::Normal;
+                    state.status_line = "cancelled".to_string();
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                KeyCode::Char(c) => {
+                    buffer.push(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
         Mode::Normal => {}
     }
 
@@ -255,11 +386,23 @@ async fn handle_key(
         }
         KeyCode::Char('a') => {
             state.mode = Mode::AddBridge { buffer: String::new() };
-            state.status_line = "paste/type a Bridge line, Enter to try it, Esc to cancel".to_string();
+        }
+        KeyCode::Char('n') => {
+            if state.dns_shim_addr.is_some() {
+                dns_controller.stop();
+                state.dns_shim_addr = None;
+                state.status_line = "DNS shim stopped".to_string();
+            } else {
+                state.mode = Mode::EnterDnsAddr {
+                    buffer: "127.0.0.1:9535".to_string(),
+                };
+            }
+        }
+        KeyCode::Char('k') => {
+            state.mode = Mode::KillSwitchMenu;
         }
         KeyCode::Char('d') => {
             state.mode = Mode::ConfirmDisable;
-            state.status_line = "disable which kill switch?  [s]coped   [r]adical   [Esc] cancel".to_string();
         }
         _ => {}
     }
@@ -275,6 +418,7 @@ fn draw(frame: &mut Frame, state: &AppState) {
             Constraint::Length(5),
             Constraint::Min(10),
             Constraint::Length(LOG_TAIL_LINES as u16 + 2),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
@@ -302,7 +446,8 @@ fn draw(frame: &mut Frame, state: &AppState) {
     draw_killswitch_panel(frame, right[1], state);
 
     draw_log_panel(frame, rows[3], state);
-    draw_status_line(frame, rows[4], state);
+    draw_help_line(frame, rows[4], state);
+    draw_status_line(frame, rows[5], state);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -320,17 +465,15 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn draw_services_panel(frame: &mut Frame, area: Rect, state: &AppState) {
-    let dns_line = match state.services.dns_shim_addr {
-        Some(addr) => format!("DNS shim:  UP on {addr}"),
-        None => "DNS shim:  not running (pass --dns-shim <addr> to enable)".to_string(),
+    let dns_line = match state.dns_shim_addr {
+        Some(addr) => format!("DNS shim:  UP on {addr}  (n to stop)"),
+        None => "DNS shim:  not running  (n to start)".to_string(),
     };
-    let bridges_line = if state.services.bridges_configured == 0 {
-        "Bridges:   none configured (running in direct mode)".to_string()
+    let bridge_count = state.health.candidates.len();
+    let bridges_line = if bridge_count == 0 {
+        "Bridges:   none configured (running in direct mode, a to add one)".to_string()
     } else {
-        format!(
-            "Bridges:   {} configured — see the candidates table below",
-            state.services.bridges_configured
-        )
+        format!("Bridges:   {bridge_count} configured — see the candidates table below")
     };
     let text = format!(
         "SOCKS5:    UP on {}   ({} connections total, {} active)\n{}\n{}",
@@ -466,9 +609,20 @@ fn draw_log_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     );
 }
 
+/// Always-visible, context-sensitive list of keys the user can press right
+/// now — separate from the line below it, which holds one-off results.
+fn draw_help_line(frame: &mut Frame, area: Rect, state: &AppState) {
+    frame.render_widget(
+        Paragraph::new(help_text(&state.mode)).style(Style::default().fg(Color::Yellow)),
+        area,
+    );
+}
+
 fn draw_status_line(frame: &mut Frame, area: Rect, state: &AppState) {
     let text = match &state.mode {
         Mode::AddBridge { buffer } => format!("add bridge> {buffer}\u{2588}"),
+        Mode::EnterScopedUid { buffer } => format!("scoped kill switch, protect uid> {buffer}\u{2588}"),
+        Mode::EnterDnsAddr { buffer } => format!("DNS shim bind address> {buffer}\u{2588}"),
         _ => state.status_line.clone(),
     };
     frame.render_widget(Paragraph::new(text), area);
