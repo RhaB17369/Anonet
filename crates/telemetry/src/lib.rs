@@ -1,11 +1,38 @@
 //! Live health state, published over a `watch` channel: cheap for
 //! `anonet-bridges`' health monitor to update, cheap for any number of
-//! readers (a log line today, a TUI dashboard in a later milestone) to
-//! subscribe to without polling.
+//! readers (a log line, a TUI dashboard) to subscribe to without polling.
 
+use std::collections::VecDeque;
 use std::time::SystemTime;
 
 use tokio::sync::watch;
+
+/// How many recent health-check outcomes to keep for the active bridge's
+/// latency history (used by the TUI's sparkline). Fixed rather than
+/// configurable — this is display history, not something worth a CLI flag.
+pub const HISTORY_CAPACITY: usize = 120;
+
+#[derive(Debug, Clone)]
+pub struct HealthSample {
+    pub at: SystemTime,
+    pub success: bool,
+    pub latency_ms: u64,
+}
+
+/// Last known status of one configured bridge candidate. Populated when a
+/// candidate is actually checked (at startup, or during a failover scan) —
+/// candidates further down the list than whichever one is currently active
+/// are not checked on every tick (that would mean a full throwaway Tor
+/// bootstrap per candidate per tick), so `last_checked_at` can be stale or
+/// absent for those.
+#[derive(Debug, Clone)]
+pub struct CandidateStatus {
+    pub index: usize,
+    pub line: String,
+    pub last_success: Option<bool>,
+    pub last_latency_ms: Option<u64>,
+    pub last_checked_at: Option<SystemTime>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct HealthStatus {
@@ -15,6 +42,57 @@ pub struct HealthStatus {
     pub last_switch_at: Option<SystemTime>,
     pub consecutive_failures: u32,
     pub total_switches: u64,
+    pub history: VecDeque<HealthSample>,
+    pub candidates: Vec<CandidateStatus>,
+}
+
+impl HealthStatus {
+    /// Seeds the candidates table with every configured bridge, all
+    /// "not yet checked", so the TUI can show the full failover pool from
+    /// the start rather than only entries that happen to have been tried.
+    pub fn seed_candidates(&mut self, all: &[(usize, String)]) {
+        self.candidates = all
+            .iter()
+            .map(|(index, line)| CandidateStatus {
+                index: *index,
+                line: line.clone(),
+                last_success: None,
+                last_latency_ms: None,
+                last_checked_at: None,
+            })
+            .collect();
+    }
+
+    pub fn push_sample(&mut self, sample: HealthSample) {
+        self.history.push_back(sample);
+        while self.history.len() > HISTORY_CAPACITY {
+            self.history.pop_front();
+        }
+    }
+
+    pub fn record_candidate_result(
+        &mut self,
+        index: usize,
+        line: &str,
+        success: bool,
+        latency_ms: u64,
+    ) {
+        let now = Some(SystemTime::now());
+        if let Some(c) = self.candidates.iter_mut().find(|c| c.index == index) {
+            c.last_success = Some(success);
+            c.last_latency_ms = Some(latency_ms);
+            c.last_checked_at = now;
+        } else {
+            self.candidates.push(CandidateStatus {
+                index,
+                line: line.to_string(),
+                last_success: Some(success),
+                last_latency_ms: Some(latency_ms),
+                last_checked_at: now,
+            });
+            self.candidates.sort_by_key(|c| c.index);
+        }
+    }
 }
 
 #[derive(Clone)]

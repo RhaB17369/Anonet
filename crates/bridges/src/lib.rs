@@ -124,6 +124,17 @@ impl BridgeManager {
         self.candidates.lock().expect("poisoned").len()
     }
 
+    /// All configured candidates as `(index, line)`, in failover order.
+    pub fn all_candidates(&self) -> Vec<(usize, String)> {
+        self.candidates
+            .lock()
+            .expect("poisoned")
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.line.clone()))
+            .collect()
+    }
+
     pub fn candidate_line(&self, idx: usize) -> Option<String> {
         self.candidates.lock().expect("poisoned").get(idx).map(|c| c.line.clone())
     }
@@ -245,6 +256,19 @@ impl BridgeManager {
     /// client each time) and returns the index and production config of the
     /// first one that actually works.
     pub async fn find_healthy_config(&self, timeout: Duration) -> Result<(usize, TorClientConfig)> {
+        self.find_healthy_config_reporting(timeout, |_, _| {}).await
+    }
+
+    /// Same as `find_healthy_config`, but calls `on_result(idx, &result)`
+    /// for every candidate it actually tries — including the ones that
+    /// fail before the winner is found — so a caller (the CLI, wiring up
+    /// telemetry) can keep a "last known status" table for every
+    /// configured bridge, not just the one that ends up active.
+    pub async fn find_healthy_config_reporting(
+        &self,
+        timeout: Duration,
+        mut on_result: impl FnMut(usize, &HealthResult),
+    ) -> Result<(usize, TorClientConfig)> {
         let count = self.candidate_count();
         if count == 0 {
             return Err(anyhow!("no bridge candidates configured"));
@@ -252,6 +276,7 @@ impl BridgeManager {
 
         for idx in 0..count {
             let result = self.health_check(idx, timeout).await;
+            on_result(idx, &result);
             if result.success {
                 info!(
                     bridge = %result.candidate_line,

@@ -136,6 +136,13 @@ async fn main() -> Result<()> {
     }
 }
 
+fn anonet_log_path() -> std::path::PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("anonet")
+        .join("anonet.log")
+}
+
 /// Logs go to stdout normally. In `--tui` mode stdout belongs to the
 /// dashboard, so logs go to a file instead.
 fn init_tracing(tui_mode: bool) -> Result<()> {
@@ -145,13 +152,15 @@ fn init_tracing(tui_mode: bool) -> Result<()> {
         return Ok(());
     }
 
-    let dir = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("anonet");
-    std::fs::create_dir_all(&dir)?;
-    let log_path = dir.join("anonet.log");
+    let log_path = anonet_log_path();
+    if let Some(dir) = log_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(file)
+        .with_ansi(false)
         .init();
     eprintln!("--tui: logs going to {}", log_path.display());
     Ok(())
@@ -279,10 +288,21 @@ async fn run(
         for line in &bridges {
             manager.add_bridge_line(line)?;
         }
+        telemetry.update(|s| s.seed_candidates(&manager.all_candidates()));
 
         tracing::info!(count = bridges.len(), "checking configured bridges");
+        let telemetry_for_scan = telemetry.clone();
         let core = match manager
-            .find_healthy_config(Duration::from_secs(bridge_timeout_secs))
+            .find_healthy_config_reporting(Duration::from_secs(bridge_timeout_secs), |idx, result| {
+                telemetry_for_scan.update(|s| {
+                    s.record_candidate_result(
+                        idx,
+                        &result.candidate_line,
+                        result.success,
+                        result.latency.as_millis() as u64,
+                    )
+                });
+            })
             .await
         {
             Ok((idx, config)) => {
@@ -303,6 +323,7 @@ async fn run(
     };
 
     let handle = Arc::new(CoreHandle::new(core));
+    let check_now = Arc::new(tokio::sync::Notify::new());
 
     if let (Some(manager), Some(idx)) = (bridge_manager, active_bridge_idx) {
         let monitor = BridgeMonitor::new(
@@ -313,6 +334,7 @@ async fn run(
             Duration::from_secs(bridge_check_interval_secs),
             Duration::from_secs(bridge_timeout_secs),
             bridge_failure_threshold,
+            Arc::clone(&check_now),
         );
         tokio::spawn(async move {
             monitor.run().await;
@@ -335,7 +357,7 @@ async fn run(
                 tracing::error!(error = %err, "SOCKS5 server stopped");
             }
         });
-        anonet_tui::run(handle, health_rx).await
+        anonet_tui::run(handle, health_rx, check_now, anonet_log_path()).await
     } else {
         server.run(ListenerConfig { bind }).await
     }

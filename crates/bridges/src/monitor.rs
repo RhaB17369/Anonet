@@ -7,34 +7,40 @@
 //! the shared `CoreHandle` — never by reconfiguring the live client (see
 //! the module-level doc comment in `lib.rs` for why that's unsafe).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anonet_core::{AnonCore, CoreHandle};
-use anonet_telemetry::Reporter;
+use anonet_telemetry::{HealthSample, Reporter};
+use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::BridgeManager;
 
 pub struct BridgeMonitor {
     manager: BridgeManager,
-    core_handle: std::sync::Arc<CoreHandle>,
+    core_handle: Arc<CoreHandle>,
     telemetry: Reporter,
     check_interval: Duration,
     check_timeout: Duration,
     failure_threshold: u32,
     active_idx: AtomicUsize,
+    /// Lets a caller (e.g. the TUI's "check now" key) wake the loop early
+    /// instead of waiting out the rest of `check_interval`.
+    check_now: Arc<Notify>,
 }
 
 impl BridgeMonitor {
     pub fn new(
         manager: BridgeManager,
-        core_handle: std::sync::Arc<CoreHandle>,
+        core_handle: Arc<CoreHandle>,
         telemetry: Reporter,
         initial_active_idx: usize,
         check_interval: Duration,
         check_timeout: Duration,
         failure_threshold: u32,
+        check_now: Arc<Notify>,
     ) -> Self {
         telemetry.update(|s| {
             s.active_bridge_index = Some(initial_active_idx);
@@ -48,22 +54,36 @@ impl BridgeMonitor {
             check_timeout,
             failure_threshold,
             active_idx: AtomicUsize::new(initial_active_idx),
+            check_now,
         }
     }
 
-    /// Runs forever, checking the active bridge every `check_interval` and
-    /// failing over after `failure_threshold` consecutive failures. Meant
-    /// to be spawned as a background task; it never returns under normal
-    /// operation.
+    /// Runs forever, checking the active bridge every `check_interval` (or
+    /// immediately when `check_now` is notified) and failing over after
+    /// `failure_threshold` consecutive failures. Meant to be spawned as a
+    /// background task; it never returns under normal operation.
     pub async fn run(&self) {
         let mut consecutive_failures = 0u32;
 
         loop {
-            tokio::time::sleep(self.check_interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(self.check_interval) => {}
+                _ = self.check_now.notified() => {}
+            }
 
             let idx = self.active_idx.load(Ordering::SeqCst);
             let result = self.manager.health_check(idx, self.check_timeout).await;
-            self.telemetry.update(|s| s.last_check_at = Some(SystemTime::now()));
+            let line = result.candidate_line.clone();
+            let latency_ms = result.latency.as_millis() as u64;
+            self.telemetry.update(|s| {
+                s.last_check_at = Some(SystemTime::now());
+                s.push_sample(HealthSample {
+                    at: SystemTime::now(),
+                    success: result.success,
+                    latency_ms,
+                });
+                s.record_candidate_result(idx, &line, result.success, latency_ms);
+            });
 
             if result.success {
                 if consecutive_failures > 0 {
@@ -88,7 +108,22 @@ impl BridgeMonitor {
             }
 
             warn!("failure threshold reached, searching for a replacement bridge");
-            match self.manager.find_healthy_config(self.check_timeout).await {
+            let telemetry = &self.telemetry;
+            let scan = self
+                .manager
+                .find_healthy_config_reporting(self.check_timeout, |cand_idx, cand_result| {
+                    telemetry.update(|s| {
+                        s.record_candidate_result(
+                            cand_idx,
+                            &cand_result.candidate_line,
+                            cand_result.success,
+                            cand_result.latency.as_millis() as u64,
+                        );
+                    });
+                })
+                .await;
+
+            match scan {
                 Ok((new_idx, _new_config)) if new_idx == idx => {
                     // The only healthy candidate is the one we already
                     // thought was down — a transient blip, not a real
