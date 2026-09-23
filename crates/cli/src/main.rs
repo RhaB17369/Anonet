@@ -3,63 +3,75 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use anonet_bridges::{BridgeManager, BridgeMonitor, TransportBinary};
+use anonet_bridges::{BridgeCoordinator, BridgeManager, TransportBinary};
 use anonet_core::{AnonCore, CoreHandle};
 use anonet_leakguard::{DnsShim, KillSwitch, current_uid};
 use anonet_socks::{ListenerConfig, SocksServer};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
+/// `anonet` with no arguments boots straight into the live dashboard with
+/// default settings — like `htop`/`btop`/`k9s`, not like a daemon you have
+/// to remember a flag to actually see. `anonet run ...` is the same thing,
+/// spelled out explicitly (useful in scripts/docs); `--headless` opts back
+/// out to a plain log stream for systemd units and the like.
 #[derive(Parser)]
 #[command(name = "anonet", version, about = "Rust orchestration layer on top of Tor")]
 struct Cli {
+    #[command(flatten)]
+    run: RunArgs,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+}
+
+#[derive(Args, Clone)]
+struct RunArgs {
+    #[arg(long, default_value = "127.0.0.1:9450")]
+    bind: SocketAddr,
+
+    /// A torrc-style `Bridge ...` line. Repeatable; tried in order until
+    /// one passes its health check. More can be added live from the
+    /// dashboard (`a` key) once running.
+    #[arg(long = "bridge", value_name = "LINE")]
+    bridges: Vec<String>,
+
+    /// A pluggable-transport binary to register, as `protocol=/path/to/binary`
+    /// (e.g. `obfs4=/usr/bin/obfs4proxy`). Repeatable.
+    #[arg(long = "pt", value_name = "PROTOCOL=PATH")]
+    pluggable_transports: Vec<String>,
+
+    /// Seconds to wait for a bridge health check before trying the next one.
+    #[arg(long, default_value_t = 30)]
+    bridge_timeout_secs: u64,
+
+    /// Also run a DNS-over-UDP shim on this address, resolving every
+    /// query via Tor. For apps that resolve names themselves instead of
+    /// using SOCKS5 hostname CONNECT.
+    #[arg(long = "dns-shim", value_name = "ADDR")]
+    dns_shim: Option<SocketAddr>,
+
+    /// Seconds between background health checks of the active bridge
+    /// once running.
+    #[arg(long, default_value_t = 60)]
+    bridge_check_interval_secs: u64,
+
+    /// Consecutive failed health checks before searching for a
+    /// replacement bridge.
+    #[arg(long, default_value_t = 3)]
+    bridge_failure_threshold: u32,
+
+    /// Skip the live dashboard and just log to stdout — for scripts,
+    /// systemd units, or anywhere else nothing will be watching a
+    /// terminal. The dashboard is the default: this is meant to be run and
+    /// watched, not launched blind.
+    #[arg(long)]
+    headless: bool,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Bootstrap Tor and run the local SOCKS5 front end.
-    Run {
-        #[arg(long, default_value = "127.0.0.1:9450")]
-        bind: SocketAddr,
-
-        /// A torrc-style `Bridge ...` line. Repeatable; tried in order until
-        /// one passes its health check.
-        #[arg(long = "bridge", value_name = "LINE")]
-        bridges: Vec<String>,
-
-        /// A pluggable-transport binary to register, as `protocol=/path/to/binary`
-        /// (e.g. `obfs4=/usr/bin/obfs4proxy`). Repeatable.
-        #[arg(long = "pt", value_name = "PROTOCOL=PATH")]
-        pluggable_transports: Vec<String>,
-
-        /// Seconds to wait for a bridge health check before trying the next one.
-        #[arg(long, default_value_t = 30)]
-        bridge_timeout_secs: u64,
-
-        /// Also run a DNS-over-UDP shim on this address, resolving every
-        /// query via Tor. For apps that resolve names themselves instead of
-        /// using SOCKS5 hostname CONNECT.
-        #[arg(long = "dns-shim", value_name = "ADDR")]
-        dns_shim: Option<SocketAddr>,
-
-        /// Seconds between background health checks of the active bridge
-        /// once running. Only meaningful when --bridge is used.
-        #[arg(long, default_value_t = 60)]
-        bridge_check_interval_secs: u64,
-
-        /// Consecutive failed health checks before searching for a
-        /// replacement bridge.
-        #[arg(long, default_value_t = 3)]
-        bridge_failure_threshold: u32,
-
-        /// Run the live status dashboard in the foreground instead of
-        /// logging to stdout. Logs go to a file
-        /// (~/.local/share/anonet/anonet.log or $XDG_DATA_HOME equivalent)
-        /// instead, so they don't corrupt the terminal UI.
-        #[arg(long)]
-        tui: bool,
-    },
+    /// Explicit spelling of the default action (bootstrap Tor + SOCKS front end).
+    Run(RunArgs),
 
     /// Manage the nftables kill switches. Requires root.
     Killswitch {
@@ -106,34 +118,18 @@ enum KillswitchAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let tui_mode = matches!(&cli.command, Command::Run { tui: true, .. });
-    init_tracing(tui_mode)?;
-
-    match cli.command {
-        Command::Run {
-            bind,
-            bridges,
-            pluggable_transports,
-            bridge_timeout_secs,
-            dns_shim,
-            bridge_check_interval_secs,
-            bridge_failure_threshold,
-            tui,
-        } => {
-            run(
-                bind,
-                bridges,
-                pluggable_transports,
-                bridge_timeout_secs,
-                dns_shim,
-                bridge_check_interval_secs,
-                bridge_failure_threshold,
-                tui,
-            )
-            .await
+    let run_args = match cli.command {
+        Some(Command::Run(args)) => args,
+        Some(Command::Killswitch { action }) => {
+            init_tracing(false)?;
+            return killswitch(action).await;
         }
-        Command::Killswitch { action } => killswitch(action).await,
-    }
+        None => cli.run,
+    };
+
+    let tui_mode = !run_args.headless;
+    init_tracing(tui_mode)?;
+    run(run_args).await
 }
 
 fn anonet_log_path() -> std::path::PathBuf {
@@ -143,8 +139,8 @@ fn anonet_log_path() -> std::path::PathBuf {
         .join("anonet.log")
 }
 
-/// Logs go to stdout normally. In `--tui` mode stdout belongs to the
-/// dashboard, so logs go to a file instead.
+/// Logs go to stdout normally. With the dashboard running, stdout belongs
+/// to it, so logs go to a file instead.
 fn init_tracing(tui_mode: bool) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::from_default_env();
     if !tui_mode {
@@ -162,7 +158,7 @@ fn init_tracing(tui_mode: bool) -> Result<()> {
         .with_writer(file)
         .with_ansi(false)
         .init();
-    eprintln!("--tui: logs going to {}", log_path.display());
+    eprintln!("logs going to {} (dashboard is using stdout)", log_path.display());
     Ok(())
 }
 
@@ -243,16 +239,18 @@ fn mode_label(mode: KsMode) -> &'static str {
     }
 }
 
-async fn run(
-    bind: SocketAddr,
-    bridges: Vec<String>,
-    pluggable_transports: Vec<String>,
-    bridge_timeout_secs: u64,
-    dns_shim: Option<SocketAddr>,
-    bridge_check_interval_secs: u64,
-    bridge_failure_threshold: u32,
-    tui: bool,
-) -> Result<()> {
+async fn run(args: RunArgs) -> Result<()> {
+    let RunArgs {
+        bind,
+        bridges,
+        pluggable_transports,
+        bridge_timeout_secs,
+        dns_shim,
+        bridge_check_interval_secs,
+        bridge_failure_threshold,
+        headless,
+    } = args;
+
     let (telemetry, health_rx) = anonet_telemetry::channel();
 
     // Log every telemetry change, so live health/failover state is visible
@@ -270,29 +268,26 @@ async fn run(
         }
     });
 
-    let mut active_bridge_idx: Option<usize> = None;
-    let mut bridge_manager: Option<BridgeManager> = None;
+    let transports = pluggable_transports
+        .iter()
+        .map(|spec| parse_pt_spec(spec))
+        .collect::<Result<Vec<_>>>()?;
+    let manager = Arc::new(BridgeManager::new(transports));
+    for line in &bridges {
+        manager.add_bridge_line(line)?;
+    }
+    telemetry.update(|s| s.seed_candidates(&manager.all_candidates()));
 
-    let core = if bridges.is_empty() {
+    let mut active_bridge_idx: Option<usize> = None;
+    let core = if manager.candidate_count() == 0 {
         tracing::info!("bootstrapping Tor client (this can take a few seconds)");
         let core = AnonCore::bootstrap().await?;
         tracing::info!("Tor client bootstrapped");
         core
     } else {
-        let transports = pluggable_transports
-            .iter()
-            .map(|spec| parse_pt_spec(spec))
-            .collect::<Result<Vec<_>>>()?;
-
-        let manager = BridgeManager::new(transports);
-        for line in &bridges {
-            manager.add_bridge_line(line)?;
-        }
-        telemetry.update(|s| s.seed_candidates(&manager.all_candidates()));
-
-        tracing::info!(count = bridges.len(), "checking configured bridges");
+        tracing::info!(count = manager.candidate_count(), "checking configured bridges");
         let telemetry_for_scan = telemetry.clone();
-        let core = match manager
+        match manager
             .find_healthy_config_reporting(Duration::from_secs(bridge_timeout_secs), |idx, result| {
                 telemetry_for_scan.update(|s| {
                     s.record_candidate_result(
@@ -317,27 +312,29 @@ async fn run(
                 );
                 AnonCore::bootstrap().await?
             }
-        };
-        bridge_manager = Some(manager);
-        core
+        }
     };
 
     let handle = Arc::new(CoreHandle::new(core));
     let check_now = Arc::new(tokio::sync::Notify::new());
 
-    if let (Some(manager), Some(idx)) = (bridge_manager, active_bridge_idx) {
-        let monitor = BridgeMonitor::new(
-            manager,
-            Arc::clone(&handle),
-            telemetry.clone(),
-            idx,
-            Duration::from_secs(bridge_check_interval_secs),
-            Duration::from_secs(bridge_timeout_secs),
-            bridge_failure_threshold,
-            Arc::clone(&check_now),
-        );
+    // Always running, even with zero bridges configured at startup: this is
+    // what lets the dashboard's "add a bridge" action take effect without a
+    // restart, not just automatic failover among pre-configured ones.
+    let coordinator = Arc::new(BridgeCoordinator::new(
+        Arc::clone(&manager),
+        Arc::clone(&handle),
+        telemetry.clone(),
+        active_bridge_idx,
+        Duration::from_secs(bridge_check_interval_secs),
+        Duration::from_secs(bridge_timeout_secs),
+        bridge_failure_threshold,
+        Arc::clone(&check_now),
+    ));
+    {
+        let coordinator = Arc::clone(&coordinator);
         tokio::spawn(async move {
-            monitor.run().await;
+            coordinator.run().await;
         });
     }
 
@@ -351,20 +348,20 @@ async fn run(
     }
 
     let server = SocksServer::new(Arc::clone(&handle), telemetry.clone());
-    if tui {
+    if headless {
+        server.run(ListenerConfig { bind }).await
+    } else {
         let services = anonet_tui::ServicesInfo {
             socks_addr: bind,
             dns_shim_addr: dns_shim,
-            bridges_configured: bridges.len(),
+            bridges_configured: manager.candidate_count(),
         };
         tokio::spawn(async move {
             if let Err(err) = server.run(ListenerConfig { bind }).await {
                 tracing::error!(error = %err, "SOCKS5 server stopped");
             }
         });
-        anonet_tui::run(handle, health_rx, check_now, anonet_log_path(), services).await
-    } else {
-        server.run(ListenerConfig { bind }).await
+        anonet_tui::run(handle, health_rx, check_now, anonet_log_path(), services, coordinator).await
     }
 }
 

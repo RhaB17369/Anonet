@@ -25,9 +25,9 @@
 //! with the winning config, so it never carries over a stale direct-Tor
 //! guard either.
 
-mod monitor;
+mod coordinator;
 
-pub use monitor::BridgeMonitor;
+pub use coordinator::BridgeCoordinator;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -107,17 +107,21 @@ impl BridgeManager {
         }
     }
 
-    /// Adds a bridge line to the end of the failover order. Bridges added
-    /// first are preferred; `find_healthy_config` tries them in order.
-    pub fn add_bridge_line(&self, line: &str) -> Result<()> {
+    /// Adds a bridge line to the end of the failover order and returns its
+    /// index. Bridges added first are preferred; `find_healthy_config`
+    /// tries them in order. Safe to call at any time, including while
+    /// `BridgeCoordinator::run` is already active — candidates are behind
+    /// a mutex specifically so this can be driven live (e.g. from the TUI).
+    pub fn add_bridge_line(&self, line: &str) -> Result<usize> {
         let builder: BridgeConfigBuilder = line
             .parse()
             .map_err(|e| anyhow!("invalid bridge line '{line}': {e}"))?;
-        self.candidates.lock().expect("poisoned").push(Candidate {
+        let mut candidates = self.candidates.lock().expect("poisoned");
+        candidates.push(Candidate {
             line: line.to_string(),
             builder,
         });
-        Ok(())
+        Ok(candidates.len() - 1)
     }
 
     pub fn candidate_count(&self) -> usize {

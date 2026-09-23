@@ -1,16 +1,21 @@
-//! Live status dashboard (`anonet run --tui`): bridge/circuit health with
-//! a latency sparkline, the full bridge-candidate pool's last known
-//! status, active isolation buckets, kill switch status, and a tail of
-//! the log file — all read from the same `CoreHandle` and
-//! `anonet-telemetry` channel the rest of the app uses, no separate IPC.
+//! Live status dashboard: bridge/circuit health with a latency sparkline,
+//! the full bridge-candidate pool's last known status, active isolation
+//! buckets, kill switch status, and a tail of the log file — all read
+//! from the same `CoreHandle` and `anonet-telemetry` channel the rest of
+//! the app uses, no separate IPC. This is the default UI (`anonet` with
+//! no flags); `--headless` skips it.
 //!
-//! The only action exposed is *disabling* a kill switch (`d`, then
-//! `s`/`r`). Deliberately one-directional: turning a kill switch off is
-//! always safe to offer from a dashboard, but turning the radical one on
-//! is a disruptive, whole-machine action that deserves the explicit
-//! `anonet killswitch enable` command, not a stray keypress. `c` forces
-//! an immediate health check of the active bridge instead of waiting out
-//! the rest of the check interval.
+//! Two actions are exposed, both safe to trigger from a keypress:
+//! - `a`: type in a new bridge line and try it live, via
+//!   `anonet-bridges::BridgeCoordinator::try_add_bridge` — the same
+//!   activate-if-healthy path automatic failover uses, just triggered
+//!   manually instead of by the background monitor.
+//! - `d`: disable a kill switch. Deliberately one-directional — turning
+//!   one off is always safe to offer here, but turning the disruptive
+//!   radical one on stays behind the explicit `anonet killswitch enable`
+//!   command, not a stray keypress.
+//! - `c`: force an immediate health check of the active bridge instead of
+//!   waiting out the rest of the check interval.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -18,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use anonet_bridges::BridgeCoordinator;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -59,6 +65,12 @@ pub struct ServicesInfo {
     pub bridges_configured: usize,
 }
 
+enum Mode {
+    Normal,
+    ConfirmDisable,
+    AddBridge { buffer: String },
+}
+
 struct AppState {
     started_at: Instant,
     services: ServicesInfo,
@@ -66,7 +78,7 @@ struct AppState {
     isolation: Vec<(String, u32, Duration)>,
     killswitches: KillSwitchView,
     status_line: String,
-    pending_disable_prompt: bool,
+    mode: Mode,
     log_tail: Vec<String>,
 }
 
@@ -74,15 +86,17 @@ struct AppState {
 /// terminal (raw mode + alternate screen) for the duration and always
 /// restores it on the way out, including on error.
 ///
-/// `check_now` lets the `c` key wake `anonet-bridges::BridgeMonitor`
+/// `check_now` lets the `c` key wake `anonet-bridges::BridgeCoordinator`
 /// early instead of waiting out the rest of its check interval.
 /// `log_path` is tailed on every refresh tick for the log panel.
+/// `coordinator` is what `a` (add a bridge live) calls into.
 pub async fn run(
     core: Arc<CoreHandle>,
     mut health_rx: watch::Receiver<HealthStatus>,
     check_now: Arc<Notify>,
     log_path: PathBuf,
     services: ServicesInfo,
+    coordinator: Arc<BridgeCoordinator>,
 ) -> Result<()> {
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -97,8 +111,8 @@ pub async fn run(
         health: health_rx.borrow().clone(),
         isolation: Vec::new(),
         killswitches: KillSwitchView::default(),
-        status_line: "q: quit   c: check bridge now   d: disable a kill switch".to_string(),
-        pending_disable_prompt: false,
+        status_line: "q: quit   a: add bridge   c: check bridge now   d: disable a kill switch".to_string(),
+        mode: Mode::Normal,
         log_tail: Vec::new(),
     };
     refresh_snapshot(&core, &log_path, &mut state).await;
@@ -125,7 +139,7 @@ pub async fn run(
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        if handle_key(key.code, &mut state, &check_now).await {
+                        if handle_key(key.code, &mut state, &check_now, &coordinator).await {
                             break;
                         }
                     }
@@ -164,32 +178,73 @@ async fn refresh_killswitch_status(state: &mut AppState) {
 }
 
 /// Returns `true` if the app should quit.
-async fn handle_key(code: KeyCode, state: &mut AppState, check_now: &Notify) -> bool {
-    if state.pending_disable_prompt {
-        match code {
-            KeyCode::Char('s') => {
-                state.pending_disable_prompt = false;
-                state.status_line = match (KillSwitch::Scoped { protect_uid: 0 }).disable().await {
-                    Ok(()) => "scoped kill switch disabled".to_string(),
-                    Err(err) => format!("failed to disable scoped kill switch: {err}"),
-                };
-                refresh_killswitch_status(state).await;
+async fn handle_key(
+    code: KeyCode,
+    state: &mut AppState,
+    check_now: &Notify,
+    coordinator: &Arc<BridgeCoordinator>,
+) -> bool {
+    match &mut state.mode {
+        Mode::ConfirmDisable => {
+            match code {
+                KeyCode::Char('s') => {
+                    state.mode = Mode::Normal;
+                    state.status_line = match (KillSwitch::Scoped { protect_uid: 0 }).disable().await {
+                        Ok(()) => "scoped kill switch disabled".to_string(),
+                        Err(err) => format!("failed to disable scoped kill switch: {err}"),
+                    };
+                    refresh_killswitch_status(state).await;
+                }
+                KeyCode::Char('r') => {
+                    state.mode = Mode::Normal;
+                    state.status_line = match (KillSwitch::Radical { anonet_uid: 0 }).disable().await {
+                        Ok(()) => "radical kill switch disabled".to_string(),
+                        Err(err) => format!("failed to disable radical kill switch: {err}"),
+                    };
+                    refresh_killswitch_status(state).await;
+                }
+                KeyCode::Esc => {
+                    state.mode = Mode::Normal;
+                    state.status_line = "cancelled".to_string();
+                }
+                _ => {}
             }
-            KeyCode::Char('r') => {
-                state.pending_disable_prompt = false;
-                state.status_line = match (KillSwitch::Radical { anonet_uid: 0 }).disable().await {
-                    Ok(()) => "radical kill switch disabled".to_string(),
-                    Err(err) => format!("failed to disable radical kill switch: {err}"),
-                };
-                refresh_killswitch_status(state).await;
-            }
-            KeyCode::Esc => {
-                state.pending_disable_prompt = false;
-                state.status_line = "cancelled".to_string();
-            }
-            _ => {}
+            return false;
         }
-        return false;
+        Mode::AddBridge { buffer } => {
+            match code {
+                KeyCode::Enter => {
+                    let line = buffer.clone();
+                    state.mode = Mode::Normal;
+                    if line.trim().is_empty() {
+                        state.status_line = "cancelled (empty bridge line)".to_string();
+                        return false;
+                    }
+                    state.status_line = "checking new bridge... (watch the candidates table)".to_string();
+                    let coordinator = Arc::clone(coordinator);
+                    tokio::spawn(async move {
+                        // Result surfaces via the candidates table (and
+                        // active_bridge_line on success) through the same
+                        // telemetry channel the dashboard already watches —
+                        // no separate return path needed.
+                        let _ = coordinator.try_add_bridge(&line).await;
+                    });
+                }
+                KeyCode::Esc => {
+                    state.mode = Mode::Normal;
+                    state.status_line = "cancelled".to_string();
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                KeyCode::Char(c) => {
+                    buffer.push(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+        Mode::Normal => {}
     }
 
     match code {
@@ -198,8 +253,12 @@ async fn handle_key(code: KeyCode, state: &mut AppState, check_now: &Notify) -> 
             check_now.notify_one();
             state.status_line = "requested an immediate bridge health check".to_string();
         }
+        KeyCode::Char('a') => {
+            state.mode = Mode::AddBridge { buffer: String::new() };
+            state.status_line = "paste/type a Bridge line, Enter to try it, Esc to cancel".to_string();
+        }
         KeyCode::Char('d') => {
-            state.pending_disable_prompt = true;
+            state.mode = Mode::ConfirmDisable;
             state.status_line = "disable which kill switch?  [s]coped   [r]adical   [Esc] cancel".to_string();
         }
         _ => {}
@@ -408,7 +467,11 @@ fn draw_log_panel(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn draw_status_line(frame: &mut Frame, area: Rect, state: &AppState) {
-    frame.render_widget(Paragraph::new(state.status_line.clone()), area);
+    let text = match &state.mode {
+        Mode::AddBridge { buffer } => format!("add bridge> {buffer}\u{2588}"),
+        _ => state.status_line.clone(),
+    };
+    frame.render_widget(Paragraph::new(text), area);
 }
 
 fn format_system_time(t: Option<std::time::SystemTime>) -> String {
