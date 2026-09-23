@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 
 use anonet_core::CoreHandle;
 use anonet_leakguard::{Destination, LeakPolicy};
+use anonet_telemetry::Reporter;
 
 const SOCKS_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -47,15 +48,16 @@ pub struct ListenerConfig {
 pub struct SocksServer {
     core: Arc<CoreHandle>,
     policy: LeakPolicy,
+    telemetry: Reporter,
 }
 
 impl SocksServer {
-    pub fn new(core: Arc<CoreHandle>) -> Self {
-        Self::with_policy(core, LeakPolicy::strict())
+    pub fn new(core: Arc<CoreHandle>, telemetry: Reporter) -> Self {
+        Self::with_policy(core, LeakPolicy::strict(), telemetry)
     }
 
-    pub fn with_policy(core: Arc<CoreHandle>, policy: LeakPolicy) -> Self {
-        Self { core, policy }
+    pub fn with_policy(core: Arc<CoreHandle>, policy: LeakPolicy, telemetry: Reporter) -> Self {
+        Self { core, policy, telemetry }
     }
 
     pub async fn run(&self, cfg: ListenerConfig) -> Result<()> {
@@ -68,10 +70,13 @@ impl SocksServer {
             let (stream, peer) = listener.accept().await?;
             let core = Arc::clone(&self.core);
             let policy = self.policy;
+            let telemetry = self.telemetry.clone();
             tokio::spawn(async move {
+                telemetry.connection_opened();
                 if let Err(err) = handle_conn(stream, core, policy).await {
                     debug!(%peer, error = %err, "SOCKS5 session ended with error");
                 }
+                telemetry.connection_closed();
             });
         }
     }

@@ -329,7 +329,7 @@ async fn run(
         let monitor = BridgeMonitor::new(
             manager,
             Arc::clone(&handle),
-            telemetry,
+            telemetry.clone(),
             idx,
             Duration::from_secs(bridge_check_interval_secs),
             Duration::from_secs(bridge_timeout_secs),
@@ -350,14 +350,19 @@ async fn run(
         });
     }
 
-    let server = SocksServer::new(Arc::clone(&handle));
+    let server = SocksServer::new(Arc::clone(&handle), telemetry.clone());
     if tui {
+        let services = anonet_tui::ServicesInfo {
+            socks_addr: bind,
+            dns_shim_addr: dns_shim,
+            bridges_configured: bridges.len(),
+        };
         tokio::spawn(async move {
             if let Err(err) = server.run(ListenerConfig { bind }).await {
                 tracing::error!(error = %err, "SOCKS5 server stopped");
             }
         });
-        anonet_tui::run(handle, health_rx, check_now, anonet_log_path()).await
+        anonet_tui::run(handle, health_rx, check_now, anonet_log_path(), services).await
     } else {
         server.run(ListenerConfig { bind }).await
     }

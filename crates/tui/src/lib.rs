@@ -12,6 +12,7 @@
 //! an immediate health check of the active bridge instead of waiting out
 //! the rest of the check interval.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,8 +50,18 @@ struct KillSwitchView {
     radical: Option<bool>,
 }
 
+/// Static info about which services this process started with — doesn't
+/// change over the run's lifetime, unlike everything in `HealthStatus`.
+#[derive(Clone)]
+pub struct ServicesInfo {
+    pub socks_addr: SocketAddr,
+    pub dns_shim_addr: Option<SocketAddr>,
+    pub bridges_configured: usize,
+}
+
 struct AppState {
     started_at: Instant,
+    services: ServicesInfo,
     health: HealthStatus,
     isolation: Vec<(String, u32, Duration)>,
     killswitches: KillSwitchView,
@@ -71,6 +82,7 @@ pub async fn run(
     mut health_rx: watch::Receiver<HealthStatus>,
     check_now: Arc<Notify>,
     log_path: PathBuf,
+    services: ServicesInfo,
 ) -> Result<()> {
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -81,6 +93,7 @@ pub async fn run(
 
     let mut state = AppState {
         started_at: Instant::now(),
+        services,
         health: health_rx.borrow().clone(),
         isolation: Vec::new(),
         killswitches: KillSwitchView::default(),
@@ -200,6 +213,7 @@ fn draw(frame: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Min(10),
             Constraint::Length(LOG_TAIL_LINES as u16 + 2),
             Constraint::Length(1),
@@ -207,11 +221,12 @@ fn draw(frame: &mut Frame, state: &AppState) {
         .split(area);
 
     draw_header(frame, rows[0], state);
+    draw_services_panel(frame, rows[1], state);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(rows[1]);
+        .split(rows[2]);
 
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -227,8 +242,8 @@ fn draw(frame: &mut Frame, state: &AppState) {
     draw_isolation_panel(frame, right[0], state);
     draw_killswitch_panel(frame, right[1], state);
 
-    draw_log_panel(frame, rows[2], state);
-    draw_status_line(frame, rows[3], state);
+    draw_log_panel(frame, rows[3], state);
+    draw_status_line(frame, rows[4], state);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -241,6 +256,33 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     );
     frame.render_widget(
         Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
+        area,
+    );
+}
+
+fn draw_services_panel(frame: &mut Frame, area: Rect, state: &AppState) {
+    let dns_line = match state.services.dns_shim_addr {
+        Some(addr) => format!("DNS shim:  UP on {addr}"),
+        None => "DNS shim:  not running (pass --dns-shim <addr> to enable)".to_string(),
+    };
+    let bridges_line = if state.services.bridges_configured == 0 {
+        "Bridges:   none configured (running in direct mode)".to_string()
+    } else {
+        format!(
+            "Bridges:   {} configured — see the candidates table below",
+            state.services.bridges_configured
+        )
+    };
+    let text = format!(
+        "SOCKS5:    UP on {}   ({} connections total, {} active)\n{}\n{}",
+        state.services.socks_addr,
+        state.health.socks_connections_total,
+        state.health.socks_connections_active,
+        dns_line,
+        bridges_line,
+    );
+    frame.render_widget(
+        Paragraph::new(text).block(Block::default().title("Services").borders(Borders::ALL)),
         area,
     );
 }

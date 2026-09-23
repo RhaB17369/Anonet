@@ -44,6 +44,11 @@ pub struct HealthStatus {
     pub total_switches: u64,
     pub history: VecDeque<HealthSample>,
     pub candidates: Vec<CandidateStatus>,
+    /// SOCKS5 connections accepted since startup and currently in flight —
+    /// a metric that's visible from the moment traffic flows, independent
+    /// of whether any bridge is configured.
+    pub socks_connections_total: u64,
+    pub socks_connections_active: u64,
 }
 
 impl HealthStatus {
@@ -103,6 +108,19 @@ pub struct Reporter {
 impl Reporter {
     pub fn update(&self, f: impl FnOnce(&mut HealthStatus)) {
         self.tx.send_modify(f);
+    }
+
+    pub fn connection_opened(&self) {
+        self.update(|s| {
+            s.socks_connections_total += 1;
+            s.socks_connections_active += 1;
+        });
+    }
+
+    pub fn connection_closed(&self) {
+        self.update(|s| {
+            s.socks_connections_active = s.socks_connections_active.saturating_sub(1);
+        });
     }
 }
 
