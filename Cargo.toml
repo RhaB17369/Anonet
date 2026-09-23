@@ -6,6 +6,7 @@ members = [
     "crates/bridges",
     "crates/socks",
     "crates/telemetry",
+    "crates/tui",
     "crates/cli",
 ]
 

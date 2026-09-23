@@ -80,6 +80,18 @@ impl IsolationPolicy {
         entry.uses += 1;
         entry.token
     }
+
+    /// A snapshot of `(identity, uses, age)` for every currently-tracked
+    /// bucket, for display (e.g. the TUI's isolation panel). Doesn't affect
+    /// rotation state.
+    fn snapshot(&self) -> Vec<(String, u32, Duration)> {
+        let tokens = self.tokens.lock().expect("isolation map poisoned");
+        let now = Instant::now();
+        tokens
+            .iter()
+            .map(|(id, e)| (id.clone(), e.uses, now.duration_since(e.created_at)))
+            .collect()
+    }
 }
 
 pub struct AnonCore {
@@ -145,6 +157,11 @@ impl AnonCore {
 
     pub fn inner(&self) -> &TorClient<PreferredRuntime> {
         &self.client
+    }
+
+    /// A snapshot of every active isolation bucket: `(identity, uses, age)`.
+    pub fn isolation_snapshot(&self) -> Vec<(String, u32, Duration)> {
+        self.isolation.snapshot()
     }
 
     /// Applies a new configuration (e.g. an updated bridge/PT set) to the

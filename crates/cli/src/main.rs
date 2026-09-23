@@ -52,6 +52,13 @@ enum Command {
         /// replacement bridge.
         #[arg(long, default_value_t = 3)]
         bridge_failure_threshold: u32,
+
+        /// Run the live status dashboard in the foreground instead of
+        /// logging to stdout. Logs go to a file
+        /// (~/.local/share/anonet/anonet.log or $XDG_DATA_HOME equivalent)
+        /// instead, so they don't corrupt the terminal UI.
+        #[arg(long)]
+        tui: bool,
     },
 
     /// Manage the nftables kill switches. Requires root.
@@ -98,11 +105,10 @@ enum KillswitchAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
+    let tui_mode = matches!(&cli.command, Command::Run { tui: true, .. });
+    init_tracing(tui_mode)?;
+
     match cli.command {
         Command::Run {
             bind,
@@ -112,6 +118,7 @@ async fn main() -> Result<()> {
             dns_shim,
             bridge_check_interval_secs,
             bridge_failure_threshold,
+            tui,
         } => {
             run(
                 bind,
@@ -121,11 +128,33 @@ async fn main() -> Result<()> {
                 dns_shim,
                 bridge_check_interval_secs,
                 bridge_failure_threshold,
+                tui,
             )
             .await
         }
         Command::Killswitch { action } => killswitch(action).await,
     }
+}
+
+/// Logs go to stdout normally. In `--tui` mode stdout belongs to the
+/// dashboard, so logs go to a file instead.
+fn init_tracing(tui_mode: bool) -> Result<()> {
+    let filter = tracing_subscriber::EnvFilter::from_default_env();
+    if !tui_mode {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        return Ok(());
+    }
+
+    let dir = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("anonet");
+    std::fs::create_dir_all(&dir)?;
+    let log_path = dir.join("anonet.log");
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(file)
+        .init();
+    eprintln!("--tui: logs going to {}", log_path.display());
+    Ok(())
 }
 
 async fn killswitch(action: KillswitchAction) -> Result<()> {
@@ -213,14 +242,16 @@ async fn run(
     dns_shim: Option<SocketAddr>,
     bridge_check_interval_secs: u64,
     bridge_failure_threshold: u32,
+    tui: bool,
 ) -> Result<()> {
-    let (telemetry, mut health_rx) = anonet_telemetry::channel();
+    let (telemetry, health_rx) = anonet_telemetry::channel();
 
     // Log every telemetry change, so live health/failover state is visible
-    // today without needing the jalon-6 TUI to read the same channel.
+    // as tracing output even without the dashboard.
+    let mut log_rx = health_rx.clone();
     tokio::spawn(async move {
-        while health_rx.changed().await.is_ok() {
-            let status = health_rx.borrow().clone();
+        while log_rx.changed().await.is_ok() {
+            let status = log_rx.borrow().clone();
             tracing::info!(
                 active_bridge = ?status.active_bridge_line,
                 consecutive_failures = status.consecutive_failures,
@@ -297,8 +328,17 @@ async fn run(
         });
     }
 
-    let server = SocksServer::new(handle);
-    server.run(ListenerConfig { bind }).await
+    let server = SocksServer::new(Arc::clone(&handle));
+    if tui {
+        tokio::spawn(async move {
+            if let Err(err) = server.run(ListenerConfig { bind }).await {
+                tracing::error!(error = %err, "SOCKS5 server stopped");
+            }
+        });
+        anonet_tui::run(handle, health_rx).await
+    } else {
+        server.run(ListenerConfig { bind }).await
+    }
 }
 
 fn parse_pt_spec(spec: &str) -> Result<TransportBinary> {
