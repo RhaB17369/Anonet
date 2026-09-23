@@ -83,4 +83,14 @@ impl AnonCore {
     pub fn inner(&self) -> &TorClient<PreferredRuntime> {
         &self.client
     }
+
+    /// Applies a new configuration (e.g. an updated bridge/PT set) to the
+    /// running client. Best-effort: fields that cannot be changed on a live
+    /// client are warned about rather than treated as a hard failure, since
+    /// bridge rotation should degrade gracefully rather than crash the proxy.
+    pub fn reconfigure(&self, config: &TorClientConfig) -> Result<()> {
+        self.client
+            .reconfigure(config, tor_config::Reconfigure::WarnOnFailures)
+            .context("failed to apply new Tor client configuration")
+    }
 }
