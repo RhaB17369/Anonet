@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use anonet_bridges::{BridgeManager, TransportBinary};
 use anonet_core::AnonCore;
+use anonet_leakguard::DnsShim;
 use anonet_socks::{ListenerConfig, SocksServer};
 use clap::{Parser, Subcommand};
 
@@ -35,6 +36,12 @@ enum Command {
         /// Seconds to wait for a bridge health check before trying the next one.
         #[arg(long, default_value_t = 30)]
         bridge_timeout_secs: u64,
+
+        /// Also run a DNS-over-UDP shim on this address, resolving every
+        /// query via Tor. For apps that resolve names themselves instead of
+        /// using SOCKS5 hostname CONNECT.
+        #[arg(long = "dns-shim", value_name = "ADDR")]
+        dns_shim: Option<SocketAddr>,
     },
 }
 
@@ -51,7 +58,8 @@ async fn main() -> Result<()> {
             bridges,
             pluggable_transports,
             bridge_timeout_secs,
-        } => run(bind, bridges, pluggable_transports, bridge_timeout_secs).await,
+            dns_shim,
+        } => run(bind, bridges, pluggable_transports, bridge_timeout_secs, dns_shim).await,
     }
 }
 
@@ -60,6 +68,7 @@ async fn run(
     bridges: Vec<String>,
     pluggable_transports: Vec<String>,
     bridge_timeout_secs: u64,
+    dns_shim: Option<SocketAddr>,
 ) -> Result<()> {
     let core = if bridges.is_empty() {
         tracing::info!("bootstrapping Tor client (this can take a few seconds)");
@@ -96,7 +105,18 @@ async fn run(
         }
     };
 
-    let server = SocksServer::new(Arc::new(core));
+    let core = Arc::new(core);
+
+    if let Some(dns_bind) = dns_shim {
+        let shim = DnsShim::new(Arc::clone(&core));
+        tokio::spawn(async move {
+            if let Err(err) = shim.run(dns_bind).await {
+                tracing::error!(error = %err, "DNS shim stopped");
+            }
+        });
+    }
+
+    let server = SocksServer::new(core);
     server.run(ListenerConfig { bind }).await
 }
 

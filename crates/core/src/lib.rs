@@ -62,6 +62,15 @@ impl AnonCore {
             .with_context(|| format!("failed to connect to {host}:{port} via Tor"))
     }
 
+    /// Resolves `host` to its IP address(es) via the exit relay, so name
+    /// resolution never touches the local system resolver.
+    pub async fn resolve(&self, host: &str) -> Result<Vec<std::net::IpAddr>> {
+        self.client
+            .resolve(host)
+            .await
+            .with_context(|| format!("failed to resolve {host} via Tor"))
+    }
+
     /// Opens an anonymized stream isolated by `identity`: connections that
     /// share an identity may share a circuit; connections with different
     /// identities never do.

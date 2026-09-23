@@ -11,4 +11,5 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anonet-core = { path = "../core" }
+anonet-leakguard = { path = "../leakguard" }
 arti-client = { version = "0.46", features = ["tokio", "rustls"] }

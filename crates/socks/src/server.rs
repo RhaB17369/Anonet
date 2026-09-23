@@ -8,7 +8,9 @@
 //! `IsolateSOCKSAuth` — not as a real credential check: any username/password
 //! is accepted, but distinct usernames get distinct circuits. Clients that
 //! skip auth all share one "default" isolation bucket.
-//! IP-request rejection (DNS-leak policy) and ACLs land in a later milestone.
+//! DNS-leak policy (rejecting raw-IP CONNECTs) is enforced here but decided
+//! by `anonet-leakguard::LeakPolicy`. ACLs beyond that land in a later
+//! milestone.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use anonet_core::AnonCore;
+use anonet_leakguard::{Destination, LeakPolicy};
 
 const SOCKS_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -33,6 +36,7 @@ const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 const REP_SUCCESS: u8 = 0x00;
 const REP_GENERAL_FAILURE: u8 = 0x01;
+const REP_CONN_NOT_ALLOWED: u8 = 0x02;
 const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
@@ -42,16 +46,16 @@ pub struct ListenerConfig {
 
 pub struct SocksServer {
     core: Arc<AnonCore>,
-}
-
-enum Destination {
-    Host(String),
-    Ip(std::net::IpAddr),
+    policy: LeakPolicy,
 }
 
 impl SocksServer {
     pub fn new(core: Arc<AnonCore>) -> Self {
-        Self { core }
+        Self::with_policy(core, LeakPolicy::strict())
+    }
+
+    pub fn with_policy(core: Arc<AnonCore>, policy: LeakPolicy) -> Self {
+        Self { core, policy }
     }
 
     pub async fn run(&self, cfg: ListenerConfig) -> Result<()> {
@@ -63,8 +67,9 @@ impl SocksServer {
         loop {
             let (stream, peer) = listener.accept().await?;
             let core = Arc::clone(&self.core);
+            let policy = self.policy;
             tokio::spawn(async move {
-                if let Err(err) = handle_conn(stream, core).await {
+                if let Err(err) = handle_conn(stream, core, policy).await {
                     debug!(%peer, error = %err, "SOCKS5 session ended with error");
                 }
             });
@@ -72,16 +77,19 @@ impl SocksServer {
     }
 }
 
-async fn handle_conn(mut client: TcpStream, core: Arc<AnonCore>) -> Result<()> {
+async fn handle_conn(mut client: TcpStream, core: Arc<AnonCore>, policy: LeakPolicy) -> Result<()> {
     let identity = negotiate_method(&mut client).await?;
     let (dest, port) = read_connect_request(&mut client).await?;
 
+    if let Err(violation) = policy.check(&dest) {
+        warn!(%violation, "rejecting CONNECT request per DNS-leak policy");
+        send_reply(&mut client, REP_CONN_NOT_ALLOWED).await.ok();
+        return Err(violation.into());
+    }
+
     let host_for_connect = match &dest {
         Destination::Host(h) => h.clone(),
-        Destination::Ip(ip) => {
-            warn!(%ip, "CONNECT request used a raw IP address; DNS-leak enforcement lands in milestone 4");
-            ip.to_string()
-        }
+        Destination::Ip(ip) => ip.to_string(),
     };
 
     let upstream = match core

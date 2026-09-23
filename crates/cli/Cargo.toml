@@ -19,3 +19,4 @@ tracing-subscriber.workspace = true
 anonet-core = { path = "../core" }
 anonet-socks = { path = "../socks" }
 anonet-bridges = { path = "../bridges" }
+anonet-leakguard = { path = "../leakguard" }
