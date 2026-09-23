@@ -67,6 +67,11 @@ pub struct HealthStatus {
     /// `Some` once the transparent-proxy `tor` process has started.
     pub transparent_enabled: bool,
     pub recent_streams: VecDeque<StreamEvent>,
+    /// The last error from any background action (enabling full
+    /// anonymization, starting the DNS shim, etc.), so it's visible in the
+    /// UI instead of only in the log file. Cleared on the next successful
+    /// attempt of whatever produced it.
+    pub last_error: Option<(SystemTime, String)>,
 }
 
 impl HealthStatus {
@@ -98,6 +103,14 @@ impl HealthStatus {
         while self.recent_streams.len() > STREAM_EVENTS_CAPACITY {
             self.recent_streams.pop_front();
         }
+    }
+
+    pub fn record_error(&mut self, message: impl Into<String>) {
+        self.last_error = Some((SystemTime::now(), message.into()));
+    }
+
+    pub fn clear_error(&mut self) {
+        self.last_error = None;
     }
 
     pub fn record_candidate_result(

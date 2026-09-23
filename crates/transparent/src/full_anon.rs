@@ -39,6 +39,17 @@ impl FullAnonController {
     /// while (tor bootstrap + two sets of nftables rules) — callers should
     /// not block a UI thread on this.
     pub async fn enable(&self) -> Result<()> {
+        self.telemetry.update(|s| s.clear_error());
+        match self.enable_inner().await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.telemetry.update(|s| s.record_error(format!("full anonymization: {err}")));
+                Err(err)
+            }
+        }
+    }
+
+    async fn enable_inner(&self) -> Result<()> {
         let anonet_uid = current_uid().await?;
 
         {

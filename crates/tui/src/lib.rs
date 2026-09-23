@@ -708,14 +708,31 @@ fn draw_help_line(frame: &mut Frame, area: Rect, state: &AppState) {
     );
 }
 
+/// While typing, the input buffer always wins (the user is mid-action).
+/// Otherwise, a not-yet-cleared error takes priority over the ordinary
+/// transient status message — a background failure (e.g. `t` failing
+/// because it needs root) must stay visible until the user retries or
+/// something else replaces it, not vanish the instant a refresh tick
+/// redraws the frame. This is what was missing before: failures only went
+/// to the log file, so pressing `t` unprivileged looked like nothing
+/// happened at all.
 fn draw_status_line(frame: &mut Frame, area: Rect, state: &AppState) {
-    let text = match &state.mode {
-        Mode::AddBridge { buffer } => format!("add bridge> {buffer}\u{2588}"),
-        Mode::EnterScopedUid { buffer } => format!("scoped kill switch, protect uid> {buffer}\u{2588}"),
-        Mode::EnterDnsAddr { buffer } => format!("DNS shim bind address> {buffer}\u{2588}"),
-        _ => state.status_line.clone(),
+    let input_text = match &state.mode {
+        Mode::AddBridge { buffer } => Some(format!("add bridge> {buffer}\u{2588}")),
+        Mode::EnterScopedUid { buffer } => Some(format!("scoped kill switch, protect uid> {buffer}\u{2588}")),
+        Mode::EnterDnsAddr { buffer } => Some(format!("DNS shim bind address> {buffer}\u{2588}")),
+        _ => None,
     };
-    frame.render_widget(Paragraph::new(text), area);
+
+    let (text, style) = if let Some(input) = input_text {
+        (input, Style::default())
+    } else if let Some((_, msg)) = &state.health.last_error {
+        (format!("ERROR: {msg}"), Style::default().fg(Color::Red))
+    } else {
+        (state.status_line.clone(), Style::default())
+    };
+
+    frame.render_widget(Paragraph::new(text).style(style), area);
 }
 
 fn format_system_time(t: Option<std::time::SystemTime>) -> String {

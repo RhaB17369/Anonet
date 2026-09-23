@@ -196,6 +196,7 @@ impl BridgeCoordinator {
     /// ever touch `active_idx` and `core_handle` through their shared
     /// locks/atomics.
     pub async fn try_add_bridge(&self, line: &str) -> Result<usize> {
+        self.telemetry.update(|s| s.clear_error());
         let idx = self.manager.add_bridge_line(line)?;
         let result = self.manager.health_check(idx, self.check_timeout).await;
         let latency_ms = result.latency.as_millis() as u64;
@@ -204,10 +205,12 @@ impl BridgeCoordinator {
         });
 
         if !result.success {
-            return Err(anyhow!(
+            let msg = format!(
                 "new bridge failed its health check: {}",
                 result.error.unwrap_or_else(|| "unknown error".to_string())
-            ));
+            );
+            self.telemetry.update(|s| s.record_error(msg.clone()));
+            return Err(anyhow!(msg));
         }
 
         let config = self.manager.production_config(idx)?;
