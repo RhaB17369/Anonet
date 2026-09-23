@@ -14,6 +14,7 @@ anonet-core = { path = "../core" }
 anonet-bridges = { path = "../bridges" }
 anonet-leakguard = { path = "../leakguard" }
 anonet-telemetry = { path = "../telemetry" }
+anonet-transparent = { path = "../transparent" }
 
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }

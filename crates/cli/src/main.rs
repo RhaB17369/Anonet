@@ -7,6 +7,7 @@ use anonet_bridges::{BridgeCoordinator, BridgeManager, TransportBinary};
 use anonet_core::{AnonCore, CoreHandle};
 use anonet_leakguard::{DnsShimController, KillSwitch, current_uid};
 use anonet_socks::{ListenerConfig, SocksServer};
+use anonet_transparent::FullAnonController;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// `anonet` with no arguments boots straight into the live dashboard with
@@ -343,6 +344,8 @@ async fn run(args: RunArgs) -> Result<()> {
         dns_controller.start(dns_bind)?;
     }
 
+    let full_anon = Arc::new(FullAnonController::new(telemetry.clone()));
+
     let server = SocksServer::new(Arc::clone(&handle), telemetry.clone());
     if headless {
         server.run(ListenerConfig { bind }).await
@@ -361,6 +364,7 @@ async fn run(args: RunArgs) -> Result<()> {
             services,
             coordinator,
             dns_controller,
+            full_anon,
         )
         .await
     }

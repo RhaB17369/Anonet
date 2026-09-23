@@ -12,6 +12,10 @@ use tokio::sync::watch;
 /// configurable — this is display history, not something worth a CLI flag.
 pub const HISTORY_CAPACITY: usize = 120;
 
+/// How many recent transparent-proxy stream events (from Tor's
+/// ControlPort) to keep for the TUI's live-traffic panel.
+pub const STREAM_EVENTS_CAPACITY: usize = 200;
+
 #[derive(Debug, Clone)]
 pub struct HealthSample {
     pub at: SystemTime,
@@ -34,6 +38,17 @@ pub struct CandidateStatus {
     pub last_checked_at: Option<SystemTime>,
 }
 
+/// One observed Tor stream (connection) from the ControlPort's `STREAM`
+/// events — this is what makes transparently-proxied traffic visible in
+/// real time, the same way anonsurf/nyx show it, without anonet having to
+/// intercept the connections itself.
+#[derive(Debug, Clone)]
+pub struct StreamEvent {
+    pub at: SystemTime,
+    pub status: String,
+    pub target: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HealthStatus {
     pub active_bridge_index: Option<usize>,
@@ -49,6 +64,9 @@ pub struct HealthStatus {
     /// of whether any bridge is configured.
     pub socks_connections_total: u64,
     pub socks_connections_active: u64,
+    /// `Some` once the transparent-proxy `tor` process has started.
+    pub transparent_enabled: bool,
+    pub recent_streams: VecDeque<StreamEvent>,
 }
 
 impl HealthStatus {
@@ -72,6 +90,13 @@ impl HealthStatus {
         self.history.push_back(sample);
         while self.history.len() > HISTORY_CAPACITY {
             self.history.pop_front();
+        }
+    }
+
+    pub fn push_stream_event(&mut self, event: StreamEvent) {
+        self.recent_streams.push_back(event);
+        while self.recent_streams.len() > STREAM_EVENTS_CAPACITY {
+            self.recent_streams.pop_front();
         }
     }
 

@@ -1,0 +1,15 @@
+[package]
+name = "anonet-transparent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+anonet-telemetry = { path = "../telemetry" }
+anonet-leakguard = { path = "../leakguard" }

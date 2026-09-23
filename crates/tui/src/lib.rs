@@ -19,6 +19,14 @@
 //!   non-loopback traffic — it auto-reverts after 5 minutes regardless,
 //!   so a confirmed mistake here is never permanent).
 //! - `d`: disable a kill switch — always a safe, one-key action.
+//! - `t`: toggle full system-wide anonymization — a supervised real `tor`
+//!   process with TransPort/DNSPort, nftables redirecting all TCP/DNS to
+//!   it, and the radical kill switch as a fail-safe. Enabling asks for
+//!   confirmation (it's the most disruptive action here); disabling is
+//!   one key, no confirmation needed. Once running, live connections
+//!   observed through it (from Tor's own ControlPort) show up in the
+//!   "Live traffic" panel — the same visibility Parrot's anonsurf/nyx
+//!   give, since it's the same underlying mechanism.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -41,6 +49,7 @@ use tokio::sync::{Notify, watch};
 use anonet_core::CoreHandle;
 use anonet_leakguard::{DnsShimController, KillSwitch, current_uid};
 use anonet_telemetry::HealthStatus;
+use anonet_transparent::FullAnonController;
 
 const LOG_TAIL_LINES: usize = 10;
 
@@ -74,6 +83,7 @@ enum Mode {
     EnterScopedUid { buffer: String },
     ConfirmRadicalEnable,
     EnterDnsAddr { buffer: String },
+    ConfirmTransparentEnable,
 }
 
 /// The context-sensitive, always-visible list of keys available right now
@@ -83,13 +93,14 @@ enum Mode {
 /// than something you have to already know.
 fn help_text(mode: &Mode) -> &'static str {
     match mode {
-        Mode::Normal => "q quit   a add bridge   c check bridge now   n toggle DNS shim   k enable a kill switch   d disable a kill switch",
+        Mode::Normal => "q quit   a add bridge   c check now   n DNS shim   k enable killswitch   d disable killswitch   t full anonymization",
         Mode::ConfirmDisable => "s disable scoped   r disable radical   Esc cancel",
         Mode::AddBridge { .. } => "type a Bridge line   Enter submit   Esc cancel",
         Mode::KillSwitchMenu => "s enable scoped (asks for a UID)   r enable radical (asks to confirm)   Esc cancel",
         Mode::EnterScopedUid { .. } => "type the UID to confine to loopback   Enter apply   Esc cancel",
         Mode::ConfirmRadicalEnable => "y confirm (blocks ALL non-loopback traffic for 5 min, auto-reverts)   Esc cancel",
         Mode::EnterDnsAddr { .. } => "type a bind address (e.g. 127.0.0.1:9535)   Enter apply   Esc cancel",
+        Mode::ConfirmTransparentEnable => "y confirm (starts a real tor process, redirects ALL TCP/DNS through it, enables the radical kill switch as fail-safe)   Esc cancel",
     }
 }
 
@@ -100,6 +111,7 @@ struct AppState {
     isolation: Vec<(String, u32, Duration)>,
     killswitches: KillSwitchView,
     dns_shim_addr: Option<SocketAddr>,
+    transparent_running: bool,
     status_line: String,
     mode: Mode,
     log_tail: Vec<String>,
@@ -121,6 +133,7 @@ pub async fn run(
     services: ServicesInfo,
     coordinator: Arc<BridgeCoordinator>,
     dns_controller: Arc<DnsShimController>,
+    full_anon: Arc<FullAnonController>,
 ) -> Result<()> {
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -136,6 +149,7 @@ pub async fn run(
         isolation: Vec::new(),
         killswitches: KillSwitchView::default(),
         dns_shim_addr: dns_controller.bound_addr(),
+        transparent_running: full_anon.is_running().await,
         status_line: String::new(),
         mode: Mode::Normal,
         log_tail: Vec::new(),
@@ -161,11 +175,12 @@ pub async fn run(
                 refresh_snapshot(&core, &log_path, &mut state).await;
                 refresh_killswitch_status(&mut state).await;
                 state.dns_shim_addr = dns_controller.bound_addr();
+                state.transparent_running = full_anon.is_running().await;
             }
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        if handle_key(key.code, &mut state, &check_now, &coordinator, &dns_controller).await {
+                        if handle_key(key.code, &mut state, &check_now, &coordinator, &dns_controller, &full_anon).await {
                             break;
                         }
                     }
@@ -210,6 +225,7 @@ async fn handle_key(
     check_now: &Notify,
     coordinator: &Arc<BridgeCoordinator>,
     dns_controller: &Arc<DnsShimController>,
+    full_anon: &Arc<FullAnonController>,
 ) -> bool {
     match &mut state.mode {
         Mode::ConfirmDisable => {
@@ -375,6 +391,27 @@ async fn handle_key(
             }
             return false;
         }
+        Mode::ConfirmTransparentEnable => {
+            match code {
+                KeyCode::Char('y') => {
+                    state.mode = Mode::Normal;
+                    state.status_line =
+                        "starting full anonymization (tor bootstrap can take up to a minute)...".to_string();
+                    let full_anon = Arc::clone(full_anon);
+                    tokio::spawn(async move {
+                        if let Err(err) = full_anon.enable().await {
+                            tracing::error!(error = %err, "failed to enable full anonymization");
+                        }
+                    });
+                }
+                KeyCode::Esc => {
+                    state.mode = Mode::Normal;
+                    state.status_line = "cancelled".to_string();
+                }
+                _ => {}
+            }
+            return false;
+        }
         Mode::Normal => {}
     }
 
@@ -404,6 +441,18 @@ async fn handle_key(
         KeyCode::Char('d') => {
             state.mode = Mode::ConfirmDisable;
         }
+        KeyCode::Char('t') => {
+            if state.transparent_running {
+                state.status_line = "stopping full anonymization...".to_string();
+                let full_anon = Arc::clone(full_anon);
+                tokio::spawn(async move {
+                    full_anon.disable().await;
+                });
+                state.transparent_running = false;
+            } else {
+                state.mode = Mode::ConfirmTransparentEnable;
+            }
+        }
         _ => {}
     }
     false
@@ -415,7 +464,7 @@ fn draw(frame: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(10),
             Constraint::Length(LOG_TAIL_LINES as u16 + 2),
             Constraint::Length(1),
@@ -445,7 +494,13 @@ fn draw(frame: &mut Frame, state: &AppState) {
     draw_isolation_panel(frame, right[0], state);
     draw_killswitch_panel(frame, right[1], state);
 
-    draw_log_panel(frame, rows[3], state);
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(rows[3]);
+    draw_log_panel(frame, bottom[0], state);
+    draw_live_traffic_panel(frame, bottom[1], state);
+
     draw_help_line(frame, rows[4], state);
     draw_status_line(frame, rows[5], state);
 }
@@ -475,13 +530,20 @@ fn draw_services_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         format!("Bridges:   {bridge_count} configured — see the candidates table below")
     };
+    let transparent_line = if state.transparent_running {
+        "Full anonymization: RUNNING (real tor + TransPort/DNSPort redirect + radical killswitch)  (t to stop)"
+            .to_string()
+    } else {
+        "Full anonymization: off  (t to start — routes ALL system traffic through Tor)".to_string()
+    };
     let text = format!(
-        "SOCKS5:    UP on {}   ({} connections total, {} active)\n{}\n{}",
+        "SOCKS5:    UP on {}   ({} connections total, {} active)\n{}\n{}\n{}",
         state.services.socks_addr,
         state.health.socks_connections_total,
         state.health.socks_connections_active,
         dns_line,
         bridges_line,
+        transparent_line,
     );
     frame.render_widget(
         Paragraph::new(text).block(Block::default().title("Services").borders(Borders::ALL)),
@@ -605,6 +667,34 @@ fn draw_killswitch_panel(frame: &mut Frame, area: Rect, state: &AppState) {
 fn draw_log_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(
         Paragraph::new(state.log_tail.join("\n")).block(Block::default().title("Recent log").borders(Borders::ALL)),
+        area,
+    );
+}
+
+/// Live connections observed via the supervised tor's ControlPort STREAM
+/// events — only populated while full anonymization (`t`) is running,
+/// since that's the only path where anonet isn't handling connections
+/// itself and needs Tor to report them instead.
+fn draw_live_traffic_panel(frame: &mut Frame, area: Rect, state: &AppState) {
+    let text = if state.health.recent_streams.is_empty() {
+        if state.transparent_running {
+            "(waiting for traffic...)".to_string()
+        } else {
+            "(start full anonymization with t to see live traffic here)".to_string()
+        }
+    } else {
+        state
+            .health
+            .recent_streams
+            .iter()
+            .rev()
+            .take(area.height.saturating_sub(2) as usize)
+            .map(|e| format!("{:<10} {}", e.status, e.target))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    frame.render_widget(
+        Paragraph::new(text).block(Block::default().title("Live traffic").borders(Borders::ALL)),
         area,
     );
 }
