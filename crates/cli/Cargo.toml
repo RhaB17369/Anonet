@@ -1,0 +1,20 @@
+[package]
+name = "anonet-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "anonet"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+anonet-core = { path = "../core" }
+anonet-socks = { path = "../socks" }
