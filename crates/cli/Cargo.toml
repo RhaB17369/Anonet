@@ -24,3 +24,6 @@ anonet-leakguard = { path = "../leakguard" }
 anonet-telemetry = { path = "../telemetry" }
 anonet-tui = { path = "../tui" }
 anonet-transparent = { path = "../transparent" }
+
+[dev-dependencies]
+tempfile = "3"

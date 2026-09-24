@@ -1,0 +1,21 @@
+[Unit]
+Description=anonet - Rust orchestration layer on top of Tor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/anonet run --headless
+Restart=on-failure
+RestartSec=5
+
+# The base SOCKS5 proxy and bridge/DNS-shim features need no special
+# privilege. Only `anonet killswitch` and full anonymization (the `t` key,
+# not available in --headless mode) touch nftables and need root — running
+# this unit as root is the simplest default, but if this instance is only
+# ever used as a plain SOCKS5 proxy, drop root with the two lines below.
+# User=anonet
+# Group=anonet
+
+[Install]
+WantedBy=multi-user.target

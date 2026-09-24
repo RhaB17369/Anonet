@@ -31,6 +31,7 @@ impl TransparentRedirect {
         let skip_rules = format!(
             "\t\tmeta skuid {anonet_uid} return\n\
              \t\tip daddr {{ 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }} return\n\
+             \t\tip6 daddr {{ ::1/128, fc00::/7, fe80::/10 }} return\n\
              \t\ttcp dport 22 return\n"
         );
         format!(
@@ -119,6 +120,9 @@ mod tests {
         assert!(ruleset.contains("table inet anonet_transparent"));
         assert!(ruleset.contains("meta skuid 1000 return"));
         assert!(ruleset.contains("192.168.0.0/16"));
+        assert!(ruleset.contains("::1/128"));
+        assert!(ruleset.contains("fc00::/7"));
+        assert!(ruleset.contains("fe80::/10"));
         assert!(ruleset.contains("tcp dport 22 return"));
         assert!(ruleset.contains("redirect to :9040"));
         assert!(ruleset.contains("redirect to :5300"));

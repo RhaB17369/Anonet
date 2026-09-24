@@ -1,10 +1,11 @@
 mod instance_lock;
+mod status_server;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use anonet_bridges::{BridgeCoordinator, BridgeManager, TransportBinary};
 use anonet_core::{AnonCore, CoreHandle};
 use anonet_leakguard::{DnsShimController, KillSwitch, current_uid};
@@ -34,12 +35,17 @@ struct RunArgs {
 
     /// A torrc-style `Bridge ...` line. Repeatable; tried in order until
     /// one passes its health check. More can be added live from the
-    /// dashboard (`a` key) once running.
+    /// dashboard (`a` key) once running. If the line names a pluggable
+    /// transport (e.g. `obfs4`), its binary is auto-detected on disk —
+    /// `--pt` is not required for known transports.
     #[arg(long = "bridge", value_name = "LINE")]
     bridges: Vec<String>,
 
-    /// A pluggable-transport binary to register, as `protocol=/path/to/binary`
-    /// (e.g. `obfs4=/usr/bin/obfs4proxy`). Repeatable.
+    /// Registers a pluggable-transport binary at a specific path, as
+    /// `protocol=/path/to/binary` (e.g. `obfs4=/usr/bin/obfs4proxy`).
+    /// Repeatable. Only needed to override auto-detection (a non-standard
+    /// install location) or for a transport anonet doesn't know how to
+    /// find on its own.
     #[arg(long = "pt", value_name = "PROTOCOL=PATH")]
     pluggable_transports: Vec<String>,
 
@@ -81,6 +87,11 @@ enum Command {
         #[command(subcommand)]
         action: KillswitchAction,
     },
+
+    /// Report a running `anonet run` instance's live status (SOCKS
+    /// connections, active bridge, DNS shim, full anonymization) without
+    /// opening the dashboard — for scripts and systemd health checks.
+    Status,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -127,6 +138,7 @@ async fn main() -> Result<()> {
             init_tracing(false)?;
             return killswitch(action).await;
         }
+        Some(Command::Status) => return status().await,
         None => cli.run,
     };
 
@@ -144,6 +156,25 @@ fn anonet_log_path() -> std::path::PathBuf {
         .join("anonet.log")
 }
 
+const LOG_ROTATE_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The dashboard runs for long, unattended stretches with logging always
+/// on, and nothing else ever truncates `anonet.log` — left alone it grows
+/// forever. A single rotation at startup (checked each time the dashboard
+/// launches, not on a timer mid-run) is enough to bound it in practice
+/// without pulling in a rolling-file-appender dependency for what's a
+/// one-line problem: once a session's log passes the threshold, the next
+/// launch starts a fresh file and keeps one previous generation around.
+fn rotate_log_if_large(path: &std::path::Path, max_bytes: u64) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() > max_bytes {
+        let rotated = path.with_extension("log.1");
+        let _ = std::fs::rename(path, rotated);
+    }
+}
+
 /// Logs go to stdout normally. With the dashboard running, stdout belongs
 /// to it, so logs go to a file instead.
 fn init_tracing(tui_mode: bool) -> Result<()> {
@@ -157,6 +188,7 @@ fn init_tracing(tui_mode: bool) -> Result<()> {
     if let Some(dir) = log_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    rotate_log_if_large(&log_path, LOG_ROTATE_THRESHOLD_BYTES);
     let file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -235,6 +267,20 @@ async fn killswitch(action: KillswitchAction) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn status() -> Result<()> {
+    let path = status_server::socket_path();
+    let mut stream = tokio::net::UnixStream::connect(&path).await.with_context(|| {
+        format!(
+            "couldn't connect to {} — is `anonet run` currently running as this user?",
+            path.display()
+        )
+    })?;
+    let mut buf = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut stream, &mut buf).await?;
+    print!("{buf}");
+    Ok(())
 }
 
 fn mode_label(mode: KsMode) -> &'static str {
@@ -350,6 +396,16 @@ async fn run(args: RunArgs) -> Result<()> {
 
     let full_anon = Arc::new(FullAnonController::new(telemetry.clone()));
 
+    {
+        let status_health_rx = health_rx.clone();
+        let status_dns_controller = Arc::clone(&dns_controller);
+        tokio::spawn(async move {
+            if let Err(err) = status_server::serve(bind, status_health_rx, status_dns_controller).await {
+                tracing::warn!(error = %err, "status socket server stopped");
+            }
+        });
+    }
+
     let server = SocksServer::new(Arc::clone(&handle), telemetry.clone());
     if headless {
         server.run(ListenerConfig { bind }).await
@@ -414,4 +470,41 @@ fn parse_pt_spec(spec: &str) -> Result<TransportBinary> {
         return Err(anyhow!("--pt protocol and path must both be non-empty (got '{spec}')"));
     }
     Ok(TransportBinary::new(protocol, path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotate_log_if_large_renames_when_over_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("anonet.log");
+        std::fs::write(&log, vec![0u8; 100]).unwrap();
+
+        rotate_log_if_large(&log, 50);
+
+        assert!(!log.exists(), "oversized log should have been rotated away");
+        assert!(dir.path().join("anonet.log.1").exists());
+    }
+
+    #[test]
+    fn rotate_log_if_large_leaves_small_logs_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("anonet.log");
+        std::fs::write(&log, vec![0u8; 10]).unwrap();
+
+        rotate_log_if_large(&log, 50);
+
+        assert!(log.exists());
+        assert!(!dir.path().join("anonet.log.1").exists());
+    }
+
+    #[test]
+    fn rotate_log_if_large_is_a_noop_when_file_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("anonet.log");
+        rotate_log_if_large(&log, 50); // must not panic
+        assert!(!log.exists());
+    }
 }

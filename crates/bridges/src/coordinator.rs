@@ -197,7 +197,14 @@ impl BridgeCoordinator {
     /// locks/atomics.
     pub async fn try_add_bridge(&self, line: &str) -> Result<usize> {
         self.telemetry.update(|s| s.clear_error());
-        let idx = self.manager.add_bridge_line(line)?;
+        let idx = match self.manager.add_bridge_line(line) {
+            Ok(idx) => idx,
+            Err(err) => {
+                let msg = err.to_string();
+                self.telemetry.update(|s| s.record_error(msg.clone()));
+                return Err(err);
+            }
+        };
         let result = self.manager.health_check(idx, self.check_timeout).await;
         let latency_ms = result.latency.as_millis() as u64;
         self.telemetry.update(|s| {

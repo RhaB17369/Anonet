@@ -26,8 +26,10 @@
 //! guard either.
 
 mod coordinator;
+mod discovery;
 
 pub use coordinator::BridgeCoordinator;
+pub use discovery::locate_transport_binary;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -95,16 +97,54 @@ pub struct HealthResult {
 }
 
 pub struct BridgeManager {
-    transports: Vec<TransportBinary>,
+    transports: Mutex<Vec<TransportBinary>>,
     candidates: Mutex<Vec<Candidate>>,
+}
+
+/// Pulls the transport protocol name out of a torrc-style bridge line, if
+/// it has one — `Bridge obfs4 1.2.3.4:443 FINGERPRINT ...` -> `obfs4`.
+/// A vanilla (non-PT) bridge line's first field after `Bridge` is an
+/// `addr:port`, which is distinguished from a protocol name by containing
+/// a `:`.
+fn extract_transport_protocol(line: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace();
+    let first = tokens.next()?;
+    let candidate = if first.eq_ignore_ascii_case("bridge") {
+        tokens.next()?
+    } else {
+        first
+    };
+    if candidate.contains(':') {
+        None
+    } else {
+        Some(candidate.to_string())
+    }
 }
 
 impl BridgeManager {
     pub fn new(transports: Vec<TransportBinary>) -> Self {
         Self {
-            transports,
+            transports: Mutex::new(transports),
             candidates: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Makes sure a binary is registered for `protocol`, auto-detecting it
+    /// on disk (PATH plus common install dirs) if it isn't already
+    /// registered via `--pt`. This is what lets `--bridge obfs4 ...` work
+    /// on its own, without also requiring `--pt obfs4=/path` every time —
+    /// the explicit `--pt` flag remains only as an override for
+    /// non-standard install locations or unrecognized transports.
+    pub fn ensure_transport(&self, protocol: &str) -> Result<()> {
+        let mut transports = self.transports.lock().expect("poisoned");
+        if transports.iter().any(|t| t.protocol == protocol) {
+            return Ok(());
+        }
+        let path = discovery::locate_transport_binary(protocol)
+            .ok_or_else(|| anyhow!(discovery::missing_transport_message(protocol)))?;
+        info!(protocol, path = %path.display(), "auto-detected pluggable transport binary");
+        transports.push(TransportBinary::new(protocol, path));
+        Ok(())
     }
 
     /// Adds a bridge line to the end of the failover order and returns its
@@ -112,10 +152,17 @@ impl BridgeManager {
     /// tries them in order. Safe to call at any time, including while
     /// `BridgeCoordinator::run` is already active — candidates are behind
     /// a mutex specifically so this can be driven live (e.g. from the TUI).
+    /// If the line names a pluggable transport that isn't registered yet,
+    /// this auto-detects and registers its binary before accepting the
+    /// candidate, so a bare `--bridge obfs4 ...` (no `--pt`) works both at
+    /// startup and when added live.
     pub fn add_bridge_line(&self, line: &str) -> Result<usize> {
         let builder: BridgeConfigBuilder = line
             .parse()
             .map_err(|e| anyhow!("invalid bridge line '{line}': {e}"))?;
+        if let Some(protocol) = extract_transport_protocol(line) {
+            self.ensure_transport(&protocol)?;
+        }
         let mut candidates = self.candidates.lock().expect("poisoned");
         candidates.push(Candidate {
             line: line.to_string(),
@@ -159,7 +206,7 @@ impl BridgeManager {
     fn build_config(&self, idx: usize, mut base: TorClientConfigBuilder) -> Result<TorClientConfig> {
         let candidate = self.candidate(idx)?;
         base.bridges().bridges().push(candidate.builder);
-        for t in &self.transports {
+        for t in self.transports.lock().expect("poisoned").iter() {
             base.bridges().transports().push(t.to_builder()?);
         }
         base.build()
@@ -222,20 +269,54 @@ impl BridgeManager {
         };
 
         let start = Instant::now();
-        let outcome = tokio::time::timeout(timeout, async {
-            let core = AnonCore::bootstrap_with(config).await?;
-            core.connect_isolated("check.torproject.org", 443, "bridge-health-check")
-                .await?;
-            Ok::<(), anyhow::Error>(())
-        })
+
+        // Bootstrap and the test connection are timed separately (both
+        // bounded by `timeout` overall) specifically so a failure here can
+        // say *where* it got stuck: "never got past the bridge's obfs4
+        // handshake" (0%) and "connected fine but the directory download
+        // through it stalled" (40-90%) are different problems that a flat
+        // "timed out" can't tell apart — see `bootstrap_with_deadline`.
+        let core = match AnonCore::bootstrap_with_deadline(config, timeout).await {
+            Ok(core) => core,
+            Err(anonet_core::BootstrapFailure::TimedOut { percent, detail, blocked }) => {
+                drop(state_dir);
+                drop(cache_dir);
+                let mut error = format!("bootstrap timed out after {timeout:?} at {percent}% ({detail})");
+                if let Some(reason) = blocked {
+                    error.push_str(&format!(" — {reason}"));
+                }
+                return HealthResult {
+                    candidate_line: line,
+                    success: false,
+                    latency: start.elapsed(),
+                    error: Some(error),
+                };
+            }
+            Err(anonet_core::BootstrapFailure::Failed(err)) => {
+                drop(state_dir);
+                drop(cache_dir);
+                return HealthResult {
+                    candidate_line: line,
+                    success: false,
+                    latency: start.elapsed(),
+                    error: Some(err.to_string()),
+                };
+            }
+        };
+
+        let remaining = timeout.saturating_sub(start.elapsed()).max(Duration::from_secs(10));
+        let connect_outcome = tokio::time::timeout(
+            remaining,
+            core.connect_isolated("check.torproject.org", 443, "bridge-health-check"),
+        )
         .await;
 
         // Keep the temp dirs alive until the whole check is done.
         drop(state_dir);
         drop(cache_dir);
 
-        match outcome {
-            Ok(Ok(())) => HealthResult {
+        match connect_outcome {
+            Ok(Ok(_)) => HealthResult {
                 candidate_line: line,
                 success: true,
                 latency: start.elapsed(),
@@ -250,8 +331,8 @@ impl BridgeManager {
             Err(_elapsed) => HealthResult {
                 candidate_line: line,
                 success: false,
-                latency: timeout,
-                error: Some(format!("health check timed out after {timeout:?}")),
+                latency: start.elapsed(),
+                error: Some("bootstrapped, but timed out opening a test connection".to_string()),
             },
         }
     }

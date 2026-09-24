@@ -99,6 +99,40 @@ pub struct AnonCore {
     isolation: IsolationPolicy,
 }
 
+/// Why [`AnonCore::bootstrap_with_deadline`] didn't return a working client.
+#[derive(Debug)]
+pub enum BootstrapFailure {
+    /// Bootstrap itself returned an error (as opposed to running out of time).
+    Failed(anyhow::Error),
+    /// The deadline elapsed first. `percent`/`detail` come straight from
+    /// arti's own bootstrap status, so they reflect exactly how far *this*
+    /// attempt got — e.g. 0% means the bridge/guard connection itself never
+    /// succeeded, while a higher percentage means it connected fine and
+    /// stalled later (typically downloading the consensus/microdescriptors).
+    TimedOut {
+        percent: u8,
+        detail: String,
+        blocked: Option<String>,
+    },
+}
+
+impl std::fmt::Display for BootstrapFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BootstrapFailure::Failed(err) => write!(f, "{err}"),
+            BootstrapFailure::TimedOut { percent, detail, blocked } => {
+                write!(f, "bootstrap timed out at {percent}% ({detail})")?;
+                if let Some(reason) = blocked {
+                    write!(f, " — arti reports: {reason}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for BootstrapFailure {}
+
 impl AnonCore {
     /// Bootstraps a Tor client against the live public Tor network.
     pub async fn bootstrap() -> Result<Self> {
@@ -113,6 +147,44 @@ impl AnonCore {
             client,
             isolation: IsolationPolicy::new(RotationPolicy::default()),
         })
+    }
+
+    /// Bootstraps like [`Self::bootstrap_with`], but on a hard `deadline`
+    /// instead of running to completion. A bare timeout can't tell a caller
+    /// *why* it never finished — "never got past the bridge's obfs4
+    /// handshake" and "connected fine, but the directory download over that
+    /// bridge never completed" both used to surface as the same opaque
+    /// "timed out" with no way to tell them apart short of enabling
+    /// arti's own debug tracing by hand. This reports arti's own bootstrap
+    /// progress (`TorClient::bootstrap_status`) at the moment of timeout
+    /// instead, so a stuck bridge health check says *where* it got stuck.
+    pub async fn bootstrap_with_deadline(
+        config: TorClientConfig,
+        deadline: Duration,
+    ) -> std::result::Result<Self, BootstrapFailure> {
+        let client = TorClient::builder()
+            .config(config)
+            .create_unbootstrapped()
+            .context("failed to construct Tor client")
+            .map_err(BootstrapFailure::Failed)?;
+
+        tokio::select! {
+            res = client.bootstrap() => {
+                res.context("failed to bootstrap Tor client").map_err(BootstrapFailure::Failed)?;
+                Ok(Self {
+                    client,
+                    isolation: IsolationPolicy::new(RotationPolicy::default()),
+                })
+            }
+            _ = tokio::time::sleep(deadline) => {
+                let status = client.bootstrap_status();
+                Err(BootstrapFailure::TimedOut {
+                    percent: (status.as_frac() * 100.0).round().clamp(0.0, 100.0) as u8,
+                    detail: status.to_string(),
+                    blocked: status.blocked().map(|b| b.to_string()),
+                })
+            }
+        }
     }
 
     pub fn config_builder() -> TorClientConfigBuilder {
@@ -284,5 +356,32 @@ mod tests {
             .connect("check.torproject.org", 443)
             .await
             .expect("post-swap connect should succeed");
+    }
+
+    /// A 1ms deadline against a *cold* client (fresh temp state/cache dirs,
+    /// so there's no locally-cached consensus/guards from some other test
+    /// or a previous run to short-circuit through) can't possibly let a
+    /// real bootstrap finish, so this always exercises the `TimedOut`
+    /// branch without needing network access to succeed. Guards against
+    /// regressing the diagnostic itself (e.g. `percent` overflowing past
+    /// 100, or `detail` coming back empty) without needing the network
+    /// access `core_handle_swap_...` above does.
+    #[tokio::test]
+    async fn bootstrap_with_deadline_reports_progress_on_timeout() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let config = TorClientConfigBuilder::from_directories(state_dir.path(), cache_dir.path())
+            .build()
+            .unwrap();
+        match AnonCore::bootstrap_with_deadline(config, Duration::from_millis(1)).await {
+            Err(BootstrapFailure::TimedOut { percent, detail, .. }) => {
+                assert!(percent <= 100);
+                assert!(!detail.is_empty());
+            }
+            Err(BootstrapFailure::Failed(err)) => {
+                panic!("expected a timeout, got a hard failure instead: {err}")
+            }
+            Ok(_) => panic!("bootstrap should never complete within 1ms"),
+        }
     }
 }

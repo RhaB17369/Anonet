@@ -1,2 +1,6 @@
 target/
 Cargo.lock
+
+# Another tool's local state directory (Kilo Code) — never anonet's own,
+# never meant to be published.
+.kilo/
